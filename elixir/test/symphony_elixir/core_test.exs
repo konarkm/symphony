@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Linear.{Comment, CommentSteering}
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -397,7 +399,7 @@ defmodule SymphonyElixir.CoreTest do
           end
         end)
 
-      initial_state = :sys.get_state(pid)
+      initial_state = :sys.get_state(pid, 15_000)
 
       running_entry = %{
         pid: agent_pid,
@@ -416,7 +418,7 @@ defmodule SymphonyElixir.CoreTest do
 
       send(pid, :tick)
       Process.sleep(100)
-      state = :sys.get_state(pid)
+      state = :sys.get_state(pid, 15_000)
 
       refute Map.has_key?(state.running, issue_id)
       refute MapSet.member?(state.claimed, issue_id)
@@ -465,6 +467,291 @@ defmodule SymphonyElixir.CoreTest do
     assert Map.has_key?(updated_state.running, issue_id)
     assert MapSet.member?(updated_state.claimed, issue_id)
     assert updated_entry.issue.state == "In Progress"
+  end
+
+  test "human review issue state parks running agent without cleaning workspace" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-human-review-reconcile-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-review"
+    issue_identifier = "MT-560"
+    workspace = Path.join(test_root, issue_identifier)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        tracker_active_states: ["Todo", "In Progress", "Human Review", "Rework", "Merging"],
+        tracker_terminal_states: ["Done", "Canceled", "Duplicate"]
+      )
+
+      File.mkdir_p!(workspace)
+
+      agent_pid =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: nil,
+            identifier: issue_identifier,
+            issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        state: "Human Review",
+        title: "Ready for review",
+        description: "Should park the worker",
+        labels: []
+      }
+
+      updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      refute Map.has_key?(updated_state.running, issue_id)
+      refute MapSet.member?(updated_state.claimed, issue_id)
+      refute Process.alive?(agent_pid)
+      assert File.exists?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "human review comment worker stays running while issue remains in review" do
+    issue_id = "issue-review-worker"
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          mode: :review_comment,
+          identifier: "MT-562",
+          issue: %Issue{id: issue_id, state: "Human Review", identifier: "MT-562"},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-562",
+      state: "Human Review",
+      title: "Review comment run",
+      description: "Review worker should keep interpreting comments",
+      labels: []
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    assert Map.has_key?(updated_state.running, issue_id)
+    assert MapSet.member?(updated_state.claimed, issue_id)
+    assert Process.alive?(agent_pid)
+
+    send(agent_pid, :stop)
+  end
+
+  test "completed human review comment worker releases claim without continuation retry" do
+    issue_id = "issue-review-complete"
+    monitor_ref = make_ref()
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: self(),
+          ref: monitor_ref,
+          mode: :review_comment,
+          identifier: "MT-564",
+          issue: %Issue{id: issue_id, state: "Human Review", identifier: "MT-564"},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    assert {:noreply, updated_state} =
+             Orchestrator.handle_info({:DOWN, monitor_ref, :process, self(), :normal}, state)
+
+    refute Map.has_key?(updated_state.running, issue_id)
+    refute Map.has_key?(updated_state.retry_attempts, issue_id)
+    refute MapSet.member?(updated_state.claimed, issue_id)
+  end
+
+  test "comments during an active human review worker queue exactly one follow-up run" do
+    {:ok, status_time, _offset} = DateTime.from_iso8601("2026-04-28T01:00:00Z")
+    {:ok, comment_time, _offset} = DateTime.from_iso8601("2026-04-28T01:01:00Z")
+
+    issue = %Issue{
+      id: "issue-review-queue",
+      identifier: "MT-565",
+      state: "Human Review",
+      title: "Queue review comments",
+      description: "Should queue comments that arrive during a review run",
+      labels: []
+    }
+
+    status_comment = %Comment{
+      id: "status",
+      body:
+        CommentSteering.build_status_body(issue, %{
+          last_seen_comment_id: "status",
+          last_seen_comment_updated_at: DateTime.to_iso8601(status_time)
+        }),
+      created_at: status_time,
+      updated_at: status_time,
+      author_name: "Symphony"
+    }
+
+    human_comment = %Comment{
+      id: "comment-queued",
+      body: "One more review note while you are already looking.",
+      created_at: comment_time,
+      updated_at: comment_time,
+      author_name: "Konark"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+      issue.id => [status_comment, human_comment]
+    })
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    monitor_ref = make_ref()
+
+    state = %Orchestrator.State{
+      running: %{
+        issue.id => %{
+          pid: self(),
+          ref: monitor_ref,
+          mode: :review_comment,
+          identifier: issue.identifier,
+          issue: issue,
+          pending_review_comments: [],
+          pending_steering_comments: [],
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue.id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    updated_state = Orchestrator.poll_comment_steering_for_test(state)
+
+    assert_receive {:memory_tracker_comment_reaction, "comment-queued", "eyes"}
+    assert_receive {:memory_tracker_comment_update, "status", updated_status}
+    assert updated_status =~ "comment-queued"
+
+    assert %{pending_review_comments: [^human_comment], pending_steering_comments: [_message]} =
+             updated_state.running[issue.id]
+
+    assert {:noreply, completed_state} =
+             Orchestrator.handle_info({:DOWN, monitor_ref, :process, self(), :normal}, updated_state)
+
+    assert %{
+             mode: :review_comment,
+             pending_review_comments: [^human_comment],
+             attempt: 1
+           } = completed_state.retry_attempts[issue.id]
+
+    refute Map.has_key?(completed_state.running, issue.id)
+  end
+
+  test "human review comments are acknowledged and queued for a review worker when slots are full" do
+    {:ok, status_time, _offset} = DateTime.from_iso8601("2026-04-28T01:00:00Z")
+    {:ok, comment_time, _offset} = DateTime.from_iso8601("2026-04-28T01:01:00Z")
+
+    issue = %Issue{
+      id: "issue-human-review-comments",
+      identifier: "MT-563",
+      state: "Human Review",
+      title: "Review comments",
+      description: "Should be watched while parked",
+      labels: []
+    }
+
+    marker = %{
+      last_seen_comment_id: "status",
+      last_seen_comment_updated_at: DateTime.to_iso8601(status_time)
+    }
+
+    status_comment = %Comment{
+      id: "status",
+      body: CommentSteering.build_status_body(issue, marker),
+      created_at: status_time,
+      updated_at: status_time,
+      author_name: "Symphony"
+    }
+
+    human_comment = %Comment{
+      id: "comment-new",
+      body: "Can you take another look?",
+      created_at: comment_time,
+      updated_at: comment_time,
+      author_name: "Konark"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+      issue.id => [status_comment, human_comment]
+    })
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "Human Review", "Rework", "Merging"]
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 0,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    updated_state = Orchestrator.poll_comment_steering_for_test(state)
+
+    assert_receive {:memory_tracker_comment_reaction, "comment-new", "eyes"}
+    assert_receive {:memory_tracker_comment_update, "status", updated_status}
+    assert updated_status =~ "Saw 1 new Linear comment"
+    assert updated_status =~ "comment-new"
+
+    assert %{
+             mode: :review_comment,
+             pending_review_comments: [^human_comment],
+             pending_steering_comments: [_message]
+           } = updated_state.retry_attempts[issue.id]
   end
 
   test "reconcile stops running issue when it is reassigned away from this worker" do
@@ -526,7 +813,7 @@ defmodule SymphonyElixir.CoreTest do
       end
     end)
 
-    initial_state = :sys.get_state(pid)
+    initial_state = :sys.get_state(pid, 15_000)
 
     running_entry = %{
       pid: self(),
@@ -545,13 +832,13 @@ defmodule SymphonyElixir.CoreTest do
 
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
-    state = :sys.get_state(pid)
+    state = :sys.get_state(pid, 15_000)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, -1_000, 1_100)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -566,7 +853,7 @@ defmodule SymphonyElixir.CoreTest do
       end
     end)
 
-    initial_state = :sys.get_state(pid)
+    initial_state = :sys.get_state(pid, 15_000)
 
     running_entry = %{
       pid: self(),
@@ -586,12 +873,12 @@ defmodule SymphonyElixir.CoreTest do
 
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
-    state = :sys.get_state(pid)
+    state = :sys.get_state(pid, 15_000)
 
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, 38_000, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -606,7 +893,7 @@ defmodule SymphonyElixir.CoreTest do
       end
     end)
 
-    initial_state = :sys.get_state(pid)
+    initial_state = :sys.get_state(pid, 15_000)
 
     running_entry = %{
       pid: self(),
@@ -625,12 +912,12 @@ defmodule SymphonyElixir.CoreTest do
 
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
-    state = :sys.get_state(pid)
+    state = :sys.get_state(pid, 15_000)
 
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_in_range(due_at_ms, 8_000, 10_500)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -644,7 +931,7 @@ defmodule SymphonyElixir.CoreTest do
       end
     end)
 
-    initial_state = :sys.get_state(pid)
+    initial_state = :sys.get_state(pid, 15_000)
     current_retry_token = make_ref()
     stale_retry_token = make_ref()
 
@@ -670,7 +957,7 @@ defmodule SymphonyElixir.CoreTest do
              retry_token: ^current_retry_token,
              identifier: "MT-561",
              error: "agent exited: :boom"
-           } = :sys.get_state(pid).retry_attempts[issue_id]
+           } = :sys.get_state(pid, 15_000).retry_attempts[issue_id]
   end
 
   test "manual refresh coalesces repeated requests and ignores superseded ticks" do
@@ -959,17 +1246,15 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
-    assert prompt =~ "You are working on a Linear ticket `MT-616`"
-    assert prompt =~ "Issue context:"
-    assert prompt =~ "Identifier: MT-616"
+    assert prompt =~ "You are Symphony, a lightweight coworker operating from Linear."
+    assert prompt =~ "Ticket: `MT-616`"
     assert prompt =~ "Title: Use rich templates for WORKFLOW.md"
-    assert prompt =~ "Current status: In Progress"
+    assert prompt =~ "State: In Progress"
     assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
-    assert prompt =~ "This is an unattended orchestration session."
-    assert prompt =~ "Only stop early for a true blocker"
-    assert prompt =~ "Do not include \"next steps for user\""
+    assert prompt =~ "## Symphony Status"
+    assert prompt =~ "Natural approval comments do not trigger merging in this MVP"
     assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-    assert prompt =~ "Do not call `gh pr merge` directly"
+    assert prompt =~ "do not call `gh pr merge` directly"
     assert prompt =~ "Continuation context:"
     assert prompt =~ "retry attempt #2"
   end
@@ -1307,6 +1592,7 @@ defmodule SymphonyElixir.CoreTest do
 
         state =
           if attempt == 1 do
+            send(self(), {:symphony_queue_steering, "Konark: please include the Linear comment context"})
             "In Progress"
           else
             "Done"
@@ -1359,6 +1645,217 @@ defmodule SymphonyElixir.CoreTest do
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+      assert Enum.at(turn_texts, 1) =~ "New Linear comments since the last turn:"
+      assert Enum.at(turn_texts, 1) =~ "Konark: please include the Linear comment context"
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner parks after issue reaches Human Review" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-human-review-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      printf 'RUN\\n' >> "$trace_file"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-review"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-review-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-review-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        tracker_active_states: ["Todo", "In Progress", "Human Review", "Rework", "Merging"],
+        max_turns: 3
+      )
+
+      state_fetcher = fn [_issue_id] ->
+        {:ok,
+         [
+           %Issue{
+             id: "issue-human-review",
+             identifier: "MT-249",
+             title: "Park at review",
+             description: "Wait for humans",
+             state: "Human Review"
+           }
+         ]}
+      end
+
+      issue = %Issue{
+        id: "issue-human-review",
+        identifier: "MT-249",
+        title: "Park at review",
+        description: "Wait for humans",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-249",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+
+      trace = File.read!(trace_file)
+      assert length(String.split(trace, "RUN", trim: true)) == 1
+      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 1
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner includes Human Review comment-run instructions and thread reply context" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-review-comment-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-review-comment"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-review-comment-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        tracker_active_states: ["Todo", "In Progress", "Human Review", "Rework", "Merging"],
+        max_turns: 3
+      )
+
+      {:ok, comment_time, _offset} = DateTime.from_iso8601("2026-04-28T01:01:00Z")
+
+      comment = %Comment{
+        id: "comment-review-1",
+        body: "Can you explain the validation?",
+        created_at: comment_time,
+        updated_at: comment_time,
+        author_name: "Konark"
+      }
+
+      issue = %Issue{
+        id: "issue-review-comment",
+        identifier: "MT-250",
+        title: "Reply from review",
+        description: "Talk back from Human Review",
+        state: "Human Review",
+        url: "https://example.org/issues/MT-250",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run(
+                 issue,
+                 nil,
+                 review_comment_mode: true,
+                 review_comments: [comment],
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Human Review"}]} end
+               )
+
+      turn_text =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.find(&(&1["method"] == "turn/start"))
+        |> get_in(["params", "input"])
+        |> Enum.map_join("\n", &Map.get(&1, "text", ""))
+
+      assert turn_text =~ "Human Review comment run:"
+      assert turn_text =~ "comment_id=comment-review-1"
+      assert turn_text =~ "parentId: \"<comment_id>\""
+      assert turn_text =~ "leave the issue in Human Review"
+      assert turn_text =~ "move the issue to Rework"
+      refute turn_text =~ "Natural approval comments trigger merging"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)

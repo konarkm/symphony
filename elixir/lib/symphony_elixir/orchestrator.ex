@@ -8,10 +8,12 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
-  alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.Linear.{CommentSteering, Issue}
 
   @continuation_retry_delay_ms 1_000
+  @comment_poll_interval_ms 5_000
   @failure_retry_base_ms 10_000
+  @human_review_state "Human Review"
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -33,6 +35,8 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :comment_timer_ref,
+      :comment_poll_token,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -65,7 +69,11 @@ defmodule SymphonyElixir.Orchestrator do
     }
 
     run_terminal_workspace_cleanup()
-    state = schedule_tick(state, 0)
+
+    state =
+      state
+      |> schedule_tick(0)
+      |> schedule_comment_poll(@comment_poll_interval_ms)
 
     {:ok, state}
   end
@@ -116,6 +124,19 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
+  def handle_info({:poll_comments, comment_poll_token}, %{comment_poll_token: comment_poll_token} = state)
+      when is_reference(comment_poll_token) do
+    state =
+      state
+      |> poll_comment_steering()
+      |> schedule_comment_poll(@comment_poll_interval_ms)
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:poll_comments, _comment_poll_token}, state), do: {:noreply, state}
+
   def handle_info(
         {:DOWN, ref, :process, _pid, reason},
         %{running: running} = state
@@ -132,16 +153,7 @@ defmodule SymphonyElixir.Orchestrator do
         state =
           case reason do
             :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+              complete_normal_agent_run(state, issue_id, running_entry, session_id)
 
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
@@ -150,6 +162,7 @@ defmodule SymphonyElixir.Orchestrator do
 
               schedule_issue_retry(state, issue_id, next_attempt, %{
                 identifier: running_entry.identifier,
+                issue: Map.get(running_entry, :issue),
                 error: "agent exited: #{inspect(reason)}",
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path)
@@ -333,6 +346,10 @@ defmodule SymphonyElixir.Orchestrator do
     select_worker_host(state, preferred_worker_host)
   end
 
+  @doc false
+  @spec poll_comment_steering_for_test(term()) :: term()
+  def poll_comment_steering_for_test(%State{} = state), do: poll_comment_steering(state)
+
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
@@ -350,6 +367,14 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
         terminate_running_issue(state, issue.id, true)
+
+      waiting_for_human_review_state?(issue.state) and review_comment_worker_running?(state, issue.id) ->
+        refresh_running_issue_state(state, issue)
+
+      waiting_for_human_review_state?(issue.state) ->
+        Logger.info("Issue moved to Human Review: #{issue_context(issue)} state=#{issue.state}; parking active agent")
+
+        terminate_running_issue(state, issue.id, false)
 
       !issue_routable_to_worker?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
@@ -479,6 +504,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> terminate_running_issue(issue_id, false)
       |> schedule_issue_retry(issue_id, next_attempt, %{
         identifier: identifier,
+        issue: Map.get(running_entry, :issue),
         error: "stalled for #{elapsed_ms}ms without codex activity"
       })
     else
@@ -558,6 +584,7 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
+      dispatchable_issue_state?(issue.state) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
@@ -605,6 +632,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
+
+  defp dispatchable_issue_state?(state_name) when is_binary(state_name) do
+    not waiting_for_human_review_state?(state_name)
+  end
+
+  defp dispatchable_issue_state?(_state_name), do: false
+
+  defp waiting_for_human_review_state?(state_name) when is_binary(state_name) do
+    normalize_issue_state(state_name) == "human review"
+  end
+
+  defp waiting_for_human_review_state?(_state_name), do: false
 
   defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
        when is_boolean(assigned_to_worker),
@@ -657,10 +696,10 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
-  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
+  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil, runner_opts \\ []) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host, runner_opts)
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
@@ -677,7 +716,44 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
+  defp dispatch_review_comment_issue(%State{} = state, %Issue{} = issue, comments) when is_list(comments) do
+    runner_opts = [
+      review_comment_mode: true,
+      review_comments: comments,
+      steering_comments: [CommentSteering.format_steering_message(comments)]
+    ]
+
+    cond do
+      not dispatch_slots_available?(issue, state) ->
+        schedule_issue_retry(state, issue.id, nil, %{
+          identifier: issue.identifier,
+          issue: issue,
+          delay_type: :review_comment,
+          mode: :review_comment,
+          pending_review_comments: comments,
+          pending_steering_comments: runner_opts[:steering_comments],
+          error: "no available orchestrator slots"
+        })
+
+      not worker_slots_available?(state) ->
+        schedule_issue_retry(state, issue.id, nil, %{
+          identifier: issue.identifier,
+          issue: issue,
+          delay_type: :review_comment,
+          mode: :review_comment,
+          pending_review_comments: comments,
+          pending_steering_comments: runner_opts[:steering_comments],
+          error: "no available worker slots"
+        })
+
+      true ->
+        Logger.info("Dispatching Human Review comment run for #{issue_context(issue)} comments=#{length(comments)}")
+        do_dispatch_issue(state, issue, nil, nil, runner_opts ++ [mode: :review_comment])
+    end
+  end
+
+  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, runner_opts) do
+    issue = prepare_issue_for_dispatch(issue)
     recipient = self()
 
     case select_worker_host(state, preferred_worker_host) do
@@ -686,13 +762,45 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, runner_opts)
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp prepare_issue_for_dispatch(%Issue{state: state_name} = issue)
+       when is_binary(state_name) do
+    if normalize_issue_state(state_name) == "todo" do
+      move_issue_to_in_progress(issue)
+    else
+      issue
+    end
+  end
+
+  defp prepare_issue_for_dispatch(issue), do: issue
+
+  defp move_issue_to_in_progress(%Issue{id: issue_id} = issue) when is_binary(issue_id) do
+    case Tracker.update_issue_state(issue_id, "In Progress") do
+      :ok ->
+        %{issue | state: "In Progress"}
+
+      {:error, reason} ->
+        Logger.warning("Unable to move #{issue_context(issue)} to In Progress before dispatch: #{inspect(reason)}")
+        issue
+    end
+  end
+
+  defp move_issue_to_in_progress(issue), do: issue
+
+  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, runner_opts) do
+    mode = Keyword.get(runner_opts, :mode, :normal)
+
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(
+             issue,
+             recipient,
+             runner_opts
+             |> Keyword.put(:attempt, attempt)
+             |> Keyword.put(:worker_host, worker_host)
+           )
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -708,6 +816,8 @@ defmodule SymphonyElixir.Orchestrator do
             worker_host: worker_host,
             workspace_path: nil,
             session_id: nil,
+            thread_id: nil,
+            active_turn_id: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
@@ -719,6 +829,7 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
+            mode: mode,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
           })
@@ -736,6 +847,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         schedule_issue_retry(state, issue.id, next_attempt, %{
           identifier: issue.identifier,
+          issue: issue,
           error: "failed to spawn agent: #{inspect(reason)}",
           worker_host: worker_host
         })
@@ -762,6 +874,47 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
+  defp complete_normal_agent_run(%State{} = state, issue_id, %{mode: :review_comment} = running_entry, session_id) do
+    pending_review_comments = Map.get(running_entry, :pending_review_comments, [])
+
+    if pending_review_comments == [] do
+      Logger.info("Human Review comment run completed for issue_id=#{issue_id} session_id=#{session_id}; releasing review claim")
+
+      state
+      |> complete_issue(issue_id)
+      |> release_issue_claim(issue_id)
+    else
+      Logger.info("Human Review comment run completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling queued review comments=#{length(pending_review_comments)}")
+
+      state
+      |> complete_issue(issue_id)
+      |> schedule_issue_retry(issue_id, 1, %{
+        identifier: running_entry.identifier,
+        issue: Map.get(running_entry, :issue),
+        delay_type: :review_comment,
+        mode: :review_comment,
+        pending_review_comments: pending_review_comments,
+        pending_steering_comments: Map.get(running_entry, :pending_steering_comments, []),
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path)
+      })
+    end
+  end
+
+  defp complete_normal_agent_run(%State{} = state, issue_id, running_entry, session_id) do
+    Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+    state
+    |> complete_issue(issue_id)
+    |> schedule_issue_retry(issue_id, 1, %{
+      identifier: running_entry.identifier,
+      issue: Map.get(running_entry, :issue),
+      delay_type: :continuation,
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path)
+    })
+  end
+
   defp complete_issue(%State{} = state, issue_id) do
     %{
       state
@@ -782,6 +935,10 @@ defmodule SymphonyElixir.Orchestrator do
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    issue = pick_retry_issue(previous_retry, metadata)
+    pending_steering_comments = pick_retry_pending_steering(previous_retry, metadata)
+    pending_review_comments = pick_retry_pending_review(previous_retry, metadata)
+    retry_mode = pick_retry_mode(previous_retry, metadata)
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -802,9 +959,13 @@ defmodule SymphonyElixir.Orchestrator do
             retry_token: retry_token,
             due_at_ms: due_at_ms,
             identifier: identifier,
+            issue: issue,
             error: error,
             worker_host: worker_host,
-            workspace_path: workspace_path
+            workspace_path: workspace_path,
+            pending_steering_comments: pending_steering_comments,
+            pending_review_comments: pending_review_comments,
+            mode: retry_mode
           })
     }
   end
@@ -816,7 +977,11 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: Map.get(retry_entry, :identifier),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          issue: Map.get(retry_entry, :issue),
+          pending_steering_comments: Map.get(retry_entry, :pending_steering_comments, []),
+          pending_review_comments: Map.get(retry_entry, :pending_review_comments, []),
+          mode: Map.get(retry_entry, :mode)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -856,6 +1021,9 @@ defmodule SymphonyElixir.Orchestrator do
         cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
         {:noreply, release_issue_claim(state, issue_id)}
 
+      review_comment_retry?(metadata) and waiting_for_human_review_state?(issue.state) ->
+        handle_review_comment_retry(state, issue, attempt, metadata)
+
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
 
@@ -878,6 +1046,206 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
+
+  defp poll_comment_steering(%State{} = state) do
+    state
+    |> poll_running_issue_comments()
+    |> poll_retrying_issue_comments()
+    |> poll_human_review_issue_comments()
+  end
+
+  defp poll_running_issue_comments(%State{} = state) do
+    Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
+      case Map.get(running_entry, :issue) do
+        %Issue{} = issue -> poll_issue_comments(state_acc, issue_id, issue, {:running, running_entry})
+        _ -> state_acc
+      end
+    end)
+  end
+
+  defp poll_retrying_issue_comments(%State{} = state) do
+    Enum.reduce(state.retry_attempts, state, fn {issue_id, retry_entry}, state_acc ->
+      case Map.get(retry_entry, :issue) do
+        %Issue{} = issue -> poll_issue_comments(state_acc, issue_id, issue, {:retrying, retry_entry})
+        _ -> state_acc
+      end
+    end)
+  end
+
+  defp poll_human_review_issue_comments(%State{} = state) do
+    case Tracker.fetch_issues_by_states([@human_review_state]) do
+      {:ok, issues} when is_list(issues) ->
+        Enum.reduce(issues, state, &poll_human_review_issue_comment/2)
+
+      {:error, reason} ->
+        Logger.debug("Failed to fetch Human Review issues for Linear comment polling: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp poll_human_review_issue_comment(%Issue{id: issue_id} = issue, %State{} = state)
+       when is_binary(issue_id) do
+    if issue_comment_poll_in_flight?(state, issue_id) do
+      state
+    else
+      poll_issue_comments(state, issue_id, issue, {:human_review, %{}})
+    end
+  end
+
+  defp poll_human_review_issue_comment(_issue, %State{} = state), do: state
+
+  defp issue_comment_poll_in_flight?(%State{} = state, issue_id) when is_binary(issue_id) do
+    Map.has_key?(state.running, issue_id) or Map.has_key?(state.retry_attempts, issue_id)
+  end
+
+  defp poll_issue_comments(%State{} = state, issue_id, %Issue{} = issue, entry)
+       when is_binary(issue_id) do
+    case Tracker.fetch_issue_comments(issue_id) do
+      {:ok, comments} ->
+        handle_issue_comments(state, issue_id, issue, entry, comments)
+
+      {:error, reason} ->
+        Logger.debug("Failed to fetch Linear comments for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp handle_issue_comments(state, issue_id, issue, entry, comments) when is_list(comments) do
+    status_comment = CommentSteering.find_status_comment(comments)
+    marker_state = CommentSteering.marker_from_comment(status_comment)
+    actionable_comments = CommentSteering.actionable_comments(comments, marker_state)
+
+    cond do
+      marker_state in [:missing, :invalid] ->
+        marker = CommentSteering.latest_marker(comments)
+
+        :ok =
+          upsert_status_comment(issue, status_comment, marker, last_update: "Initialized comment tracking.")
+
+        state
+
+      actionable_comments == [] ->
+        state
+
+      true ->
+        Enum.each(actionable_comments, &acknowledge_comment/1)
+
+        marker =
+          actionable_comments
+          |> List.last()
+          |> CommentSteering.marker_for_comment()
+
+        steering_message = CommentSteering.format_steering_message(actionable_comments)
+
+        :ok =
+          upsert_status_comment(issue, status_comment, marker, last_update: "Saw #{length(actionable_comments)} new Linear comment(s).")
+
+        route_comment_steering(state, issue_id, issue, entry, actionable_comments, steering_message)
+    end
+  end
+
+  defp acknowledge_comment(%{id: comment_id}) when is_binary(comment_id) do
+    case Tracker.create_comment_reaction(comment_id, "eyes") do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.debug("Unable to add eyes reaction to Linear comment #{comment_id}: #{inspect(reason)}")
+        :ok
+    end
+  end
+
+  defp acknowledge_comment(_comment), do: :ok
+
+  defp upsert_status_comment(%Issue{id: issue_id} = issue, status_comment, marker, opts)
+       when is_binary(issue_id) and is_map(marker) do
+    body = CommentSteering.build_status_body(issue, marker, opts)
+
+    case status_comment do
+      %{id: comment_id} when is_binary(comment_id) ->
+        case Tracker.update_comment(comment_id, body) do
+          :ok -> :ok
+          {:error, reason} -> log_status_comment_error(issue, :update, reason)
+        end
+
+      _ ->
+        case Tracker.create_comment(issue_id, body) do
+          :ok -> :ok
+          {:error, reason} -> log_status_comment_error(issue, :create, reason)
+        end
+    end
+  end
+
+  defp log_status_comment_error(issue, operation, reason) do
+    Logger.debug("Unable to #{operation} Symphony status comment for #{issue_context(issue)}: #{inspect(reason)}")
+    :ok
+  end
+
+  defp route_comment_steering(%State{} = state, issue_id, %Issue{} = issue, {:running, %{mode: :review_comment}}, comments, message) do
+    Logger.info("Queued #{length(comments)} Human Review comment(s) for active review run on #{issue_context(issue)}")
+
+    update_running_entry(state, issue_id, %{
+      last_linear_comment_steered_at: DateTime.utc_now(),
+      pending_review_comments: comments,
+      pending_steering_comments: [message]
+    })
+  end
+
+  defp route_comment_steering(%State{} = state, issue_id, _issue, {:running, running_entry}, _comments, message) do
+    if is_pid(running_entry.pid) do
+      if running_turn_active?(running_entry) do
+        send(running_entry.pid, {:symphony_steer, message})
+      else
+        send(running_entry.pid, {:symphony_queue_steering, message})
+      end
+    end
+
+    update_running_entry(state, issue_id, %{
+      last_linear_comment_steered_at: DateTime.utc_now()
+    })
+  end
+
+  defp route_comment_steering(%State{} = state, issue_id, _issue, {:retrying, retry_entry}, _comments, message) do
+    retry_entry =
+      Map.update(retry_entry, :pending_steering_comments, [message], fn existing ->
+        existing ++ [message]
+      end)
+
+    %{state | retry_attempts: Map.put(state.retry_attempts, issue_id, retry_entry)}
+  end
+
+  defp route_comment_steering(%State{} = state, _issue_id, %Issue{} = issue, {:human_review, _entry}, comments, _message) do
+    dispatch_review_comment_issue(state, issue, comments)
+  end
+
+  defp running_turn_active?(%{pid: pid, thread_id: thread_id, active_turn_id: active_turn_id})
+       when is_pid(pid) and is_binary(thread_id) and is_binary(active_turn_id),
+       do: Process.alive?(pid)
+
+  defp running_turn_active?(_running_entry), do: false
+
+  defp update_running_entry(%State{} = state, issue_id, updates) when is_map(updates) do
+    case Map.get(state.running, issue_id) do
+      nil -> state
+      running_entry -> %{state | running: Map.put(state.running, issue_id, merge_running_entry_updates(running_entry, updates))}
+    end
+  end
+
+  defp merge_running_entry_updates(running_entry, updates) do
+    Enum.reduce(updates, running_entry, fn
+      {:pending_review_comments, comments}, entry when is_list(comments) ->
+        Map.update(entry, :pending_review_comments, comments, &append_list(&1, comments))
+
+      {:pending_steering_comments, messages}, entry when is_list(messages) ->
+        Map.update(entry, :pending_steering_comments, messages, &append_list(&1, messages))
+
+      {key, value}, entry ->
+        Map.put(entry, key, value)
+    end)
+  end
+
+  defp append_list(existing, additions) when is_list(existing), do: existing ++ additions
+  defp append_list(_existing, additions), do: additions
 
   defp run_terminal_workspace_cleanup do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
@@ -904,7 +1272,9 @@ defmodule SymphonyElixir.Orchestrator do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
-      {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
+      runner_opts = [steering_comments: metadata[:pending_steering_comments] || []]
+
+      {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host], runner_opts)}
     else
       Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
 
@@ -915,6 +1285,29 @@ defmodule SymphonyElixir.Orchestrator do
          attempt + 1,
          Map.merge(metadata, %{
            identifier: issue.identifier,
+           issue: issue,
+           error: "no available orchestrator slots"
+         })
+       )}
+    end
+  end
+
+  defp handle_review_comment_retry(state, issue, attempt, metadata) do
+    comments = metadata[:pending_review_comments] || []
+
+    if dispatch_slots_available?(issue, state) and worker_slots_available?(state, metadata[:worker_host]) do
+      {:noreply, dispatch_review_comment_issue(state, issue, comments)}
+    else
+      Logger.debug("No available slots for retrying Human Review comments for #{issue_context(issue)}; retrying again")
+
+      {:noreply,
+       schedule_issue_retry(
+         state,
+         issue.id,
+         attempt + 1,
+         Map.merge(metadata, %{
+           identifier: issue.identifier,
+           issue: issue,
            error: "no available orchestrator slots"
          })
        )}
@@ -925,11 +1318,27 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | claimed: MapSet.delete(state.claimed, issue_id)}
   end
 
+  defp review_comment_retry?(metadata) when is_map(metadata), do: metadata[:mode] == :review_comment
+
+  defp review_comment_worker_running?(%State{} = state, issue_id) when is_binary(issue_id) do
+    case Map.get(state.running, issue_id) do
+      %{mode: :review_comment} -> true
+      _ -> false
+    end
+  end
+
+  defp review_comment_worker_running?(_state, _issue_id), do: false
+
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
-    else
-      failure_retry_delay(attempt)
+    cond do
+      metadata[:delay_type] == :continuation and attempt == 1 ->
+        @continuation_retry_delay_ms
+
+      metadata[:delay_type] == :review_comment and attempt == 1 ->
+        @continuation_retry_delay_ms
+
+      true ->
+        failure_retry_delay(attempt)
     end
   end
 
@@ -962,6 +1371,22 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pick_retry_workspace_path(previous_retry, metadata) do
     metadata[:workspace_path] || Map.get(previous_retry, :workspace_path)
+  end
+
+  defp pick_retry_issue(previous_retry, metadata) do
+    metadata[:issue] || Map.get(previous_retry, :issue)
+  end
+
+  defp pick_retry_pending_steering(previous_retry, metadata) do
+    metadata[:pending_steering_comments] || Map.get(previous_retry, :pending_steering_comments, [])
+  end
+
+  defp pick_retry_pending_review(previous_retry, metadata) do
+    metadata[:pending_review_comments] || Map.get(previous_retry, :pending_review_comments, [])
+  end
+
+  defp pick_retry_mode(previous_retry, metadata) do
+    metadata[:mode] || Map.get(previous_retry, :mode)
   end
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
@@ -1122,6 +1547,8 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
+          mode: Map.get(metadata, :mode, :normal),
+          pending_review_comment_count: length(Map.get(metadata, :pending_review_comments, [])),
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
@@ -1175,6 +1602,8 @@ defmodule SymphonyElixir.Orchestrator do
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
     codex_total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
     codex_app_server_pid = Map.get(running_entry, :codex_app_server_pid)
+    thread_id = Map.get(running_entry, :thread_id)
+    active_turn_id = Map.get(running_entry, :active_turn_id)
     last_reported_input = Map.get(running_entry, :codex_last_reported_input_tokens, 0)
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
@@ -1185,6 +1614,8 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
+        thread_id: thread_id_for_update(thread_id, update),
+        active_turn_id: active_turn_id_for_update(active_turn_id, update),
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
@@ -1216,6 +1647,21 @@ defmodule SymphonyElixir.Orchestrator do
     do: session_id
 
   defp session_id_for_update(existing, _update), do: existing
+
+  defp thread_id_for_update(_existing, %{thread_id: thread_id}) when is_binary(thread_id),
+    do: thread_id
+
+  defp thread_id_for_update(existing, _update), do: existing
+
+  defp active_turn_id_for_update(_existing, %{event: :session_started, turn_id: turn_id})
+       when is_binary(turn_id),
+       do: turn_id
+
+  defp active_turn_id_for_update(_existing, %{event: event})
+       when event in [:turn_completed, :turn_failed, :turn_cancelled, :turn_ended_with_error],
+       do: nil
+
+  defp active_turn_id_for_update(existing, _update), do: existing
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,
@@ -1256,6 +1702,21 @@ defmodule SymphonyElixir.Orchestrator do
       | tick_timer_ref: timer_ref,
         tick_token: tick_token,
         next_poll_due_at_ms: System.monotonic_time(:millisecond) + delay_ms
+    }
+  end
+
+  defp schedule_comment_poll(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
+    if is_reference(state.comment_timer_ref) do
+      Process.cancel_timer(state.comment_timer_ref)
+    end
+
+    comment_poll_token = make_ref()
+    timer_ref = Process.send_after(self(), {:poll_comments, comment_poll_token}, delay_ms)
+
+    %{
+      state
+      | comment_timer_ref: timer_ref,
+        comment_poll_token: comment_poll_token
     }
   end
 
@@ -1305,6 +1766,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     candidate_issue?(issue, active_state_set(), terminal_states) and
+      dispatchable_issue_state?(issue.state) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
   end
 
