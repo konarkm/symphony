@@ -5,6 +5,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.Linear.Adapter
+  alias SymphonyElixir.Linear.Comment
   alias SymphonyElixir.Tracker.Memory
 
   @endpoint SymphonyElixirWeb.Endpoint
@@ -183,7 +184,9 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   test "tracker delegates to memory and linear adapters" do
     issue = %Issue{id: "issue-1", identifier: "MT-1", state: "In Progress"}
+    comment = %Comment{id: "comment-1", body: "human note", author_name: "Konark"}
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue, %{id: "ignored"}])
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{"issue-1" => [comment, %{id: "ignored"}]})
     Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
 
@@ -192,13 +195,23 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_candidate_issues()
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issues_by_states([" in progress ", 42])
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
+    assert {:ok, [^comment]} = SymphonyElixir.Tracker.fetch_issue_comments("issue-1")
     assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
+    assert :ok = SymphonyElixir.Tracker.create_comment_reply("issue-1", "comment-1", "reply")
+    assert :ok = SymphonyElixir.Tracker.update_comment("comment-1", "updated")
+    assert :ok = SymphonyElixir.Tracker.create_comment_reaction("comment-1", "eyes")
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
+    assert_receive {:memory_tracker_comment_reply, "issue-1", "comment-1", "reply"}
+    assert_receive {:memory_tracker_comment_update, "comment-1", "updated"}
+    assert_receive {:memory_tracker_comment_reaction, "comment-1", "eyes"}
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
 
     Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
     assert :ok = Memory.create_comment("issue-1", "quiet")
+    assert :ok = Memory.create_comment_reply("issue-1", "comment-1", "quiet reply")
+    assert :ok = Memory.update_comment("comment-1", "quiet")
+    assert :ok = Memory.create_comment_reaction("comment-1", "eyes")
     assert :ok = Memory.update_issue_state("issue-1", "Quiet")
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
@@ -219,12 +232,104 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     Process.put(
       {FakeLinearClient, :graphql_result},
+      {:ok,
+       %{
+         "data" => %{
+           "issue" => %{
+             "comments" => %{
+               "nodes" => [
+                 %{
+                   "id" => "comment-1",
+                   "body" => "hello",
+                   "parentId" => nil,
+                   "createdAt" => "2026-04-28T01:00:00Z",
+                   "updatedAt" => "2026-04-28T01:00:01Z",
+                   "user" => %{
+                     "id" => "user-1",
+                     "name" => "Konark",
+                     "displayName" => "Konark"
+                   }
+                 },
+                 %{
+                   "id" => "comment-2",
+                   "body" => "bad time",
+                   "parentId" => "comment-1",
+                   "createdAt" => "not-a-date",
+                   "updatedAt" => nil,
+                   "user" => %{"id" => "user-2", "name" => "Other", "isBot" => true}
+                 },
+                 %{"body" => "missing id"}
+               ]
+             }
+           }
+         }
+       }}
+    )
+
+    assert {:ok,
+            [
+              %Comment{id: "comment-1", body: "hello", author_name: "Konark"},
+              %Comment{
+                id: "comment-2",
+                body: "bad time",
+                parent_id: "comment-1",
+                created_at: nil,
+                updated_at: nil,
+                author_is_bot: true
+              }
+            ]} =
+             Adapter.fetch_issue_comments("issue-1")
+
+    assert_receive {:graphql_called, comments_query, %{first: 50, issueId: "issue-1"}}
+    assert comments_query =~ "comments"
+    refute comments_query =~ "isBot"
+
+    Process.put({FakeLinearClient, :graphql_result}, {:error, :boom})
+    assert {:error, :boom} = Adapter.fetch_issue_comments("issue-1")
+
+    Process.put({FakeLinearClient, :graphql_result}, {:ok, %{"data" => %{}}})
+    assert {:error, :comments_fetch_failed} = Adapter.fetch_issue_comments("issue-1")
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
       {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
     )
 
     assert :ok = Adapter.create_comment("issue-1", "hello")
     assert_receive {:graphql_called, create_comment_query, %{body: "hello", issueId: "issue-1"}}
     assert create_comment_query =~ "commentCreate"
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
+    )
+
+    assert :ok = Adapter.create_comment_reply("issue-1", "comment-1", "thread reply")
+
+    assert_receive {:graphql_called, create_reply_query, %{body: "thread reply", issueId: "issue-1", parentId: "comment-1"}}
+
+    assert create_reply_query =~ "parentId"
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"commentCreate" => %{"success" => false}}}}
+    )
+
+    assert {:error, :comment_reply_create_failed} =
+             Adapter.create_comment_reply("issue-1", "comment-1", "broken")
+
+    Process.put({FakeLinearClient, :graphql_result}, {:error, :boom})
+    assert {:error, :boom} = Adapter.create_comment_reply("issue-1", "comment-1", "boom")
+
+    Process.put({FakeLinearClient, :graphql_result}, {:ok, %{"data" => %{}}})
+
+    assert {:error, :comment_reply_create_failed} =
+             Adapter.create_comment_reply("issue-1", "comment-1", "weird")
+
+    Process.put({FakeLinearClient, :graphql_result}, :unexpected)
+
+    assert {:error, :comment_reply_create_failed} =
+             Adapter.create_comment_reply("issue-1", "comment-1", "odd")
 
     Process.put(
       {FakeLinearClient, :graphql_result},
@@ -243,6 +348,50 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     Process.put({FakeLinearClient, :graphql_result}, :unexpected)
     assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "odd")
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"commentUpdate" => %{"success" => true}}}}
+    )
+
+    assert :ok = Adapter.update_comment("comment-1", "updated")
+    assert_receive {:graphql_called, update_comment_query, %{body: "updated", commentId: "comment-1"}}
+    assert update_comment_query =~ "commentUpdate"
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"commentUpdate" => %{"success" => false}}}}
+    )
+
+    assert {:error, :comment_update_failed} = Adapter.update_comment("comment-1", "broken")
+
+    Process.put({FakeLinearClient, :graphql_result}, {:error, :boom})
+    assert {:error, :boom} = Adapter.update_comment("comment-1", "boom")
+
+    Process.put({FakeLinearClient, :graphql_result}, :unexpected)
+    assert {:error, :comment_update_failed} = Adapter.update_comment("comment-1", "odd")
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"reactionCreate" => %{"success" => true}}}}
+    )
+
+    assert :ok = Adapter.create_comment_reaction("comment-1", "eyes")
+    assert_receive {:graphql_called, reaction_query, %{commentId: "comment-1", emoji: "eyes"}}
+    assert reaction_query =~ "reactionCreate"
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"reactionCreate" => %{"success" => false}}}}
+    )
+
+    assert {:error, :reaction_create_failed} = Adapter.create_comment_reaction("comment-1", "eyes")
+
+    Process.put({FakeLinearClient, :graphql_result}, {:error, :boom})
+    assert {:error, :boom} = Adapter.create_comment_reaction("comment-1", "eyes")
+
+    Process.put({FakeLinearClient, :graphql_result}, :unexpected)
+    assert {:error, :reaction_create_failed} = Adapter.create_comment_reaction("comment-1", "eyes")
 
     Process.put(
       {FakeLinearClient, :graphql_results},

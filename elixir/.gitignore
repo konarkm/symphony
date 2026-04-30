@@ -41,6 +41,7 @@ erl_crash.dump
 # Local environment and auth artifacts.
 .env
 .env.*
+.mise.local.toml
 .secrets
 .credentials
 status.txt

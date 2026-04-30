@@ -3,6 +3,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias Ecto.Changeset
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
+  alias SymphonyElixir.Config.Schema.Workspace, as: SchemaWorkspace
   alias SymphonyElixir.Linear.Client
 
   test "workspace bootstrap can be implemented in after_create hook" do
@@ -1113,7 +1114,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
            }
   end
 
-  test "runtime sandbox policy resolution passes explicit policies through unchanged" do
+  test "runtime sandbox policy resolution passes explicit rooted policies through unchanged" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1156,6 +1157,48 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                "type" => "futureSandbox",
                "nested" => %{"flag" => true}
              }
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "runtime sandbox policy resolution fills roots for partial workspace write policies" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-runtime-sandbox-partial-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      issue_workspace = Path.join(workspace_root, "MT-102")
+      File.mkdir_p!(issue_workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_turn_sandbox_policy: %{
+          type: "workspaceWrite",
+          networkAccess: true
+        }
+      )
+
+      assert {:ok, runtime_settings} = Config.codex_runtime_settings(issue_workspace)
+      assert {:ok, canonical_issue_workspace} = SymphonyElixir.PathSafety.canonicalize(issue_workspace)
+
+      assert runtime_settings.turn_sandbox_policy == %{
+               "type" => "workspaceWrite",
+               "writableRoots" => [canonical_issue_workspace],
+               "readOnlyAccess" => %{"type" => "fullAccess"},
+               "networkAccess" => true,
+               "excludeTmpdirEnvVar" => false,
+               "excludeSlashTmp" => false
+             }
+
+      settings = Config.settings!()
+      invalid_workspace_settings = %{settings | workspace: %SchemaWorkspace{root: 123}}
+
+      assert {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_root, 123}}} =
+               Schema.resolve_runtime_turn_sandbox_policy(invalid_workspace_settings, nil)
     after
       File.rm_rf(test_root)
     end

@@ -8,6 +8,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   @linear_graphql_tool "linear_graphql"
   @linear_graphql_description """
   Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
+  Use this only for non-routine Linear operations; Symphony's outer runtime manages issue pickup,
+  status comments, comment markers, and eyes reactions. Do not query User.isBot or Issue.links,
+  because this Linear workspace schema does not expose those fields.
   """
   @linear_graphql_input_schema %{
     "type" => "object",

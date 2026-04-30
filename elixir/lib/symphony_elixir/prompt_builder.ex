@@ -4,6 +4,7 @@ defmodule SymphonyElixir.PromptBuilder do
   """
 
   alias SymphonyElixir.{Config, Workflow}
+  alias SymphonyElixir.Linear.CommentSteering
 
   @render_opts [strict_variables: true, strict_filters: true]
 
@@ -18,7 +19,8 @@ defmodule SymphonyElixir.PromptBuilder do
     |> Solid.render!(
       %{
         "attempt" => Keyword.get(opts, :attempt),
-        "issue" => issue |> Map.from_struct() |> to_solid_map()
+        "issue" => issue |> Map.from_struct() |> to_solid_map(),
+        "steering_comments" => CommentSteering.continuation_context(Keyword.get(opts, :steering_comments, []))
       },
       @render_opts
     )

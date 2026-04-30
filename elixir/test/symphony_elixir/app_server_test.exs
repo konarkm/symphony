@@ -183,6 +183,120 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server forwards Symphony steering as turn steer" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-steer-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-1002")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-steer.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-steer.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-steer"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-steer"}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":1001,"result":{"turn":{"id":"turn-steer"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-steer",
+        identifier: "MT-1002",
+        title: "Forward active comment steering",
+        description: "Ensure app-server receives turn steer payloads",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-1002",
+        labels: ["backend"]
+      }
+
+      parent = self()
+
+      task =
+        Task.async(fn ->
+          AppServer.run(workspace, "Handle steering", issue,
+            on_message: fn message ->
+              send(parent, {:app_server_message, message})
+            end
+          )
+        end)
+
+      assert_receive {:app_server_message, %{event: :session_started}}, 5_000
+      send(task.pid, {:symphony_steer, "Use the newest Linear comment."})
+      assert {:ok, _result} = Task.await(task, 5_000)
+      assert_receive {:app_server_message, %{event: :turn_steered, message: "Use the newest Linear comment."}}
+
+      trace = File.read!(trace_file)
+      lines = String.split(trace, "\n", trim: true)
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 line
+                 |> String.trim_leading("JSON:")
+                 |> Jason.decode!()
+                 |> then(fn payload ->
+                   payload["method"] == "turn/steer" &&
+                     get_in(payload, ["params", "threadId"]) == "thread-steer" &&
+                     get_in(payload, ["params", "expectedTurnId"]) == "turn-steer" &&
+                     get_in(payload, ["params", "input"]) == "Use the newest Linear comment."
+                 end)
+               else
+                 false
+               end
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server marks request-for-input events as a hard failure" do
     test_root =
       Path.join(

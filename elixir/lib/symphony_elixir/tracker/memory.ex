@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   @behaviour SymphonyElixir.Tracker
 
-  alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.Linear.{Comment, Issue}
 
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
@@ -35,9 +35,38 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec fetch_issue_comments(String.t()) :: {:ok, [Comment.t()]} | {:error, term()}
+  def fetch_issue_comments(issue_id) when is_binary(issue_id) do
+    comments =
+      :symphony_elixir
+      |> Application.get_env(:memory_tracker_comments, %{})
+      |> Map.get(issue_id, [])
+      |> Enum.filter(&match?(%Comment{}, &1))
+
+    {:ok, comments}
+  end
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) do
     send_event({:memory_tracker_comment, issue_id, body})
+    :ok
+  end
+
+  @spec create_comment_reply(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def create_comment_reply(issue_id, parent_id, body) do
+    send_event({:memory_tracker_comment_reply, issue_id, parent_id, body})
+    :ok
+  end
+
+  @spec update_comment(String.t(), String.t()) :: :ok | {:error, term()}
+  def update_comment(comment_id, body) do
+    send_event({:memory_tracker_comment_update, comment_id, body})
+    :ok
+  end
+
+  @spec create_comment_reaction(String.t(), String.t()) :: :ok | {:error, term()}
+  def create_comment_reaction(comment_id, emoji) do
+    send_event({:memory_tracker_comment_reaction, comment_id, emoji})
     :ok
   end
 

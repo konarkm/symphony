@@ -308,7 +308,7 @@ defmodule SymphonyElixir.Config.Schema do
   def resolve_runtime_turn_sandbox_policy(settings, workspace \\ nil, opts \\ []) do
     case settings.codex.turn_sandbox_policy do
       %{} = policy ->
-        {:ok, policy}
+        resolve_runtime_configured_turn_sandbox_policy(policy, settings, workspace, opts)
 
       _ ->
         workspace
@@ -503,6 +503,29 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp default_runtime_turn_sandbox_policy(workspace_root, _opts) do
     {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_root, workspace_root}}}
+  end
+
+  defp resolve_runtime_configured_turn_sandbox_policy(
+         %{"type" => "workspaceWrite"} = policy,
+         settings,
+         workspace,
+         opts
+       ) do
+    if Map.has_key?(policy, "writableRoots") do
+      {:ok, policy}
+    else
+      workspace
+      |> default_workspace_root(settings.workspace.root)
+      |> default_runtime_turn_sandbox_policy(opts)
+      |> case do
+        {:ok, default_policy} -> {:ok, Map.merge(default_policy, policy)}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  defp resolve_runtime_configured_turn_sandbox_policy(policy, _settings, _workspace, _opts) do
+    {:ok, policy}
   end
 
   defp default_workspace_root(workspace, _fallback) when is_binary(workspace) and workspace != "",

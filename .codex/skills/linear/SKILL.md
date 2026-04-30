@@ -237,6 +237,23 @@ mutation CreateComment($issueId: String!, $body: String!) {
 }
 ```
 
+For a short answer to a specific Human Review comment, prefer a Linear thread
+reply by passing the parent comment id:
+
+```graphql
+mutation ReplyToComment($issueId: String!, $parentId: String!, $body: String!) {
+  commentCreate(input: { issueId: $issueId, parentId: $parentId, body: $body }) {
+    success
+    comment {
+      id
+      parent {
+        id
+      }
+    }
+  }
+}
+```
+
 ### Move an issue to a different state
 
 Use `issueUpdate` with the destination `stateId`:
