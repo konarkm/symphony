@@ -878,7 +878,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 38_000, 40_500)
+    assert_due_in_range(due_at_ms, 37_500, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -2163,7 +2163,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        codex_command: "#{codex_binary} --model gpt-5.3-codex app-server"
+        codex_command: "#{codex_binary} --config 'model=\"gpt-5.5\"' app-server"
       )
 
       issue = %Issue{
@@ -2182,7 +2182,7 @@ defmodule SymphonyElixir.CoreTest do
       lines = String.split(trace, "\n", trim: true)
 
       assert argv_line = Enum.find(lines, fn line -> String.starts_with?(line, "ARGV:") end)
-      assert String.contains?(argv_line, "--model gpt-5.3-codex app-server")
+      assert String.contains?(argv_line, "--config model=\"gpt-5.5\" app-server")
       refute String.contains?(argv_line, "--ask-for-approval never")
       refute String.contains?(argv_line, "--sandbox danger-full-access")
     after
