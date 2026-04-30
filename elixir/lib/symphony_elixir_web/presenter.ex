@@ -20,7 +20,10 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           codex_totals: snapshot.codex_totals,
-          rate_limits: snapshot.rate_limits
+          rate_limits: snapshot.rate_limits,
+          polling: Map.get(snapshot, :polling, %{checking?: false, next_poll_in_ms: nil, poll_interval_ms: nil}),
+          comment_polling: comment_polling_payload(Map.get(snapshot, :comment_polling, %{})),
+          bridge: Map.get(snapshot, :bridge, %{paused_count: 0, paused_issue_ids: [], last_command: nil})
         }
 
       :timeout ->
@@ -103,6 +106,8 @@ defmodule SymphonyElixirWeb.Presenter do
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
+      mode: Map.get(entry, :mode, :normal),
+      pending_review_comment_count: Map.get(entry, :pending_review_comment_count, 0),
       turn_count: Map.get(entry, :turn_count, 0),
       last_event: entry.last_codex_event,
       last_message: summarize_message(entry.last_codex_message),
@@ -126,6 +131,19 @@ defmodule SymphonyElixirWeb.Presenter do
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path)
     }
+  end
+
+  defp comment_polling_payload(comment_polling) when is_map(comment_polling) do
+    %{
+      last_poll_at: iso8601(Map.get(comment_polling, :last_poll_at)),
+      last_successful_poll_at: iso8601(Map.get(comment_polling, :last_successful_poll_at)),
+      last_error: Map.get(comment_polling, :last_error),
+      watched_human_review_count: Map.get(comment_polling, :watched_human_review_count, 0)
+    }
+  end
+
+  defp comment_polling_payload(_comment_polling) do
+    %{last_poll_at: nil, last_successful_poll_at: nil, last_error: nil, watched_human_review_count: 0}
   end
 
   defp running_issue_payload(running) do

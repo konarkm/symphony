@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Linear.Comment do
     :author_id,
     :author_name,
     :parent_id,
+    attachments: [],
     author_is_bot: false
   ]
 
@@ -23,6 +24,7 @@ defmodule SymphonyElixir.Linear.Comment do
           author_id: String.t() | nil,
           author_name: String.t() | nil,
           parent_id: String.t() | nil,
+          attachments: [map()],
           author_is_bot: boolean()
         }
 end

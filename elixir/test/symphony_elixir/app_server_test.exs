@@ -540,20 +540,14 @@ defmodule SymphonyElixir.AppServerTest do
                    |> String.trim_leading("JSON:")
                    |> Jason.decode!()
 
-                 payload["id"] == 2 and
-                   case get_in(payload, ["params", "dynamicTools"]) do
-                     [
-                       %{
-                         "description" => description,
-                         "inputSchema" => %{"required" => ["query"]},
-                         "name" => "linear_graphql"
-                       }
-                     ] ->
-                       description =~ "Linear"
+                 dynamic_tools = get_in(payload, ["params", "dynamicTools"]) || []
+                 linear_graphql = Enum.find(dynamic_tools, &(&1["name"] == "linear_graphql"))
 
-                     _ ->
-                       false
-                   end
+                 payload["id"] == 2 and
+                   match?(%{"description" => description, "inputSchema" => %{"required" => ["query"]}} when is_binary(description), linear_graphql) and
+                   linear_graphql["description"] =~ "Linear" and
+                   Enum.any?(dynamic_tools, &(&1["name"] == "linear_upload_file")) and
+                   Enum.any?(dynamic_tools, &(&1["name"] == "linear_download_file"))
                else
                  false
                end

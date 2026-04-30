@@ -72,6 +72,7 @@ New Linear comment context:
 - Treat Linear as the primary control surface.
 - Symphony's outer runtime owns routine Linear bookkeeping: issue pickup, `Todo` -> `In Progress`, compact status comments, comment-consumption markers, and eyes reactions.
 - Do not use Linear MCP tools or `linear_graphql` for routine state/status/comment handling. Use them only when the ticket explicitly needs extra Linear data or advanced operations.
+- Use `linear_upload_file` for generated artifacts, logs, screenshots, images, videos, and other files instead of pasting long content into comments.
 - Keep updates short, conversational, and useful.
 - Avoid long Definition-of-Done dumps unless the ticket explicitly asks for one.
 - Work only in the provided repository copy.
@@ -93,7 +94,7 @@ Keep it compact with these fields:
 
 The Symphony runtime stores comment-consumption metadata in the same comment with this hidden marker:
 
-`<!-- symphony:comments {"last_seen_comment_id":"...","last_seen_comment_updated_at":"..."} -->`
+`<!-- symphony:comments {"last_seen_comment_id":"...","last_seen_comment_updated_at":"...","paused":false} -->`
 
 Do not remove the marker. Do not create separate status dump comments.
 

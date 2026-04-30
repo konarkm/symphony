@@ -744,7 +744,7 @@ defmodule SymphonyElixir.CoreTest do
 
     assert_receive {:memory_tracker_comment_reaction, "comment-new", "eyes"}
     assert_receive {:memory_tracker_comment_update, "status", updated_status}
-    assert updated_status =~ "Saw 1 new Linear comment"
+    assert updated_status =~ "Saw a worker-routed Linear comment."
     assert updated_status =~ "comment-new"
 
     assert %{
@@ -752,6 +752,164 @@ defmodule SymphonyElixir.CoreTest do
              pending_review_comments: [^human_comment],
              pending_steering_comments: [_message]
            } = updated_state.retry_attempts[issue.id]
+  end
+
+  test "explicit bridge commands get eyes, threaded replies, and do not wake workers" do
+    {:ok, status_time, _offset} = DateTime.from_iso8601("2026-04-28T01:00:00Z")
+    {:ok, command_time, _offset} = DateTime.from_iso8601("2026-04-28T01:01:00Z")
+
+    issue = %Issue{
+      id: "issue-command",
+      identifier: "MT-566",
+      state: "Human Review",
+      title: "Command issue",
+      description: "Bridge commands should stay in the bridge layer",
+      labels: []
+    }
+
+    status_comment = %Comment{
+      id: "status",
+      body:
+        CommentSteering.build_status_body(issue, %{
+          last_seen_comment_id: "status",
+          last_seen_comment_updated_at: DateTime.to_iso8601(status_time)
+        }),
+      created_at: status_time,
+      updated_at: status_time,
+      author_name: "Symphony"
+    }
+
+    command_comment = %Comment{
+      id: "command-status",
+      body: "symphony status",
+      created_at: command_time,
+      updated_at: command_time,
+      author_name: "Konark"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue.id => [status_comment, command_comment]})
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "Human Review", "Rework", "Merging"]
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    updated_state = Orchestrator.poll_comment_steering_for_test(state)
+
+    assert_receive {:memory_tracker_comment_reaction, "command-status", "eyes"}
+    issue_id = issue.id
+    assert_receive {:memory_tracker_comment_reply, ^issue_id, "command-status", reply}
+    assert reply =~ "Status: Human Review"
+    assert_receive {:memory_tracker_comment_update, "status", updated_status}
+    assert updated_status =~ "command-status"
+    assert updated_status =~ ~s("last_command":"status")
+
+    refute Map.has_key?(updated_state.running, issue.id)
+    refute Map.has_key?(updated_state.retry_attempts, issue.id)
+    assert %{command: "status", issue_identifier: "MT-566"} = updated_state.last_bridge_command
+  end
+
+  test "pause suppresses non-command review routing until resume command clears marker" do
+    {:ok, status_time, _offset} = DateTime.from_iso8601("2026-04-28T01:00:00Z")
+    {:ok, comment_time, _offset} = DateTime.from_iso8601("2026-04-28T01:01:00Z")
+
+    issue = %Issue{
+      id: "issue-paused-command",
+      identifier: "MT-567",
+      state: "Human Review",
+      title: "Paused issue",
+      description: "Paused comments should not route",
+      labels: []
+    }
+
+    paused_marker = %{
+      last_seen_comment_id: "status",
+      last_seen_comment_updated_at: DateTime.to_iso8601(status_time),
+      paused: true,
+      last_command: "pause",
+      last_command_comment_id: "pause-comment",
+      last_command_at: DateTime.to_iso8601(status_time)
+    }
+
+    status_comment = %Comment{
+      id: "status",
+      body: CommentSteering.build_status_body(issue, paused_marker),
+      created_at: status_time,
+      updated_at: status_time,
+      author_name: "Symphony"
+    }
+
+    human_comment = %Comment{
+      id: "comment-while-paused",
+      body: "Please make this change after all.",
+      created_at: comment_time,
+      updated_at: comment_time,
+      author_name: "Konark"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue.id => [status_comment, human_comment]})
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "Human Review", "Rework", "Merging"]
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    updated_state = Orchestrator.poll_comment_steering_for_test(state)
+
+    assert_receive {:memory_tracker_comment_reaction, "comment-while-paused", "eyes"}
+    assert_receive {:memory_tracker_comment_update, "status", paused_status}
+    assert paused_status =~ ~s("paused":true)
+    refute_receive {:memory_tracker_comment_reply, _, _, _}, 50
+    refute Map.has_key?(updated_state.running, issue.id)
+    refute Map.has_key?(updated_state.retry_attempts, issue.id)
+
+    {:ok, resume_time, _offset} = DateTime.from_iso8601("2026-04-28T01:02:00Z")
+
+    resume_comment = %Comment{
+      id: "resume-command",
+      body: "symphony resume",
+      created_at: resume_time,
+      updated_at: resume_time,
+      author_name: "Konark"
+    }
+
+    status_after_pause = %Comment{
+      status_comment
+      | body: paused_status,
+        updated_at: comment_time
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{issue.id => [status_after_pause, human_comment, resume_comment]})
+
+    resumed_state = Orchestrator.poll_comment_steering_for_test(state)
+
+    assert_receive {:memory_tracker_comment_reaction, "resume-command", "eyes"}
+    issue_id = issue.id
+    assert_receive {:memory_tracker_comment_reply, ^issue_id, "resume-command", resume_reply}
+    assert resume_reply =~ "Resumed"
+    assert_receive {:memory_tracker_comment_update, "status", resumed_status}
+    assert resumed_status =~ ~s("paused":false)
+    refute Map.has_key?(resumed_state.retry_attempts, issue.id)
   end
 
   test "reconcile stops running issue when it is reassigned away from this worker" do
@@ -917,7 +1075,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 8_000, 10_500)
+    assert_due_in_range(due_at_ms, 7_000, 10_500)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do

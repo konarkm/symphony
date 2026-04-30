@@ -106,6 +106,34 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
         </section>
 
+        <section class="metric-grid">
+          <article class="metric-card">
+            <p class="metric-label">Comment poll</p>
+            <p class="metric-value numeric"><%= @payload.comment_polling.watched_human_review_count %></p>
+            <p class="metric-detail">
+              Human Review watched · last success <%= @payload.comment_polling.last_successful_poll_at || "n/a" %>
+            </p>
+          </article>
+
+          <article class="metric-card">
+            <p class="metric-label">Paused</p>
+            <p class="metric-value numeric"><%= @payload.bridge.paused_count %></p>
+            <p class="metric-detail">Issues paused by explicit Symphony bridge command.</p>
+          </article>
+
+          <article class="metric-card">
+            <p class="metric-label">Last command</p>
+            <p class="metric-value"><%= last_bridge_command_label(@payload.bridge.last_command) %></p>
+            <p class="metric-detail">Latest explicit `symphony ...` command observed.</p>
+          </article>
+
+          <article class="metric-card">
+            <p class="metric-label">Poll error</p>
+            <p class="metric-value"><%= if @payload.comment_polling.last_error, do: "Error", else: "OK" %></p>
+            <p class="metric-detail"><%= @payload.comment_polling.last_error || "No recent comment poll error." %></p>
+          </article>
+        </section>
+
         <section class="section-card">
           <div class="section-header">
             <div>
@@ -134,6 +162,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                   <col style="width: 12rem;" />
                   <col style="width: 8rem;" />
                   <col style="width: 7.5rem;" />
+                  <col style="width: 7.5rem;" />
                   <col style="width: 8.5rem;" />
                   <col />
                   <col style="width: 10rem;" />
@@ -142,6 +171,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                   <tr>
                     <th>Issue</th>
                     <th>State</th>
+                    <th>Mode</th>
                     <th>Session</th>
                     <th>Runtime / turns</th>
                     <th>Codex update</th>
@@ -160,6 +190,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <span class={state_badge_class(entry.state)}>
                         <%= entry.state %>
                       </span>
+                    </td>
+                    <td>
+                      <span class="muted"><%= format_mode(entry.mode, entry.pending_review_comment_count) %></span>
                     </td>
                     <td>
                       <div class="session-stack">
@@ -278,6 +311,23 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp format_runtime_and_turns(started_at, _turn_count, now),
     do: format_runtime_seconds(runtime_seconds_from_started_at(started_at, now))
+
+  defp format_mode(:review_comment, pending_count), do: "review - #{pending_count || 0} queued"
+  defp format_mode("review_comment", pending_count), do: "review - #{pending_count || 0} queued"
+  defp format_mode(mode, _pending_count) when is_atom(mode), do: Atom.to_string(mode)
+  defp format_mode(mode, _pending_count) when is_binary(mode), do: mode
+  defp format_mode(_mode, _pending_count), do: "normal"
+
+  defp last_bridge_command_label(nil), do: "n/a"
+
+  defp last_bridge_command_label(%{command: command, issue_identifier: identifier}) do
+    "#{identifier || "issue"} - #{command}"
+  end
+
+  defp last_bridge_command_label(command) when is_map(command),
+    do: to_string(command[:command] || command["command"] || "n/a")
+
+  defp last_bridge_command_label(_command), do: "n/a"
 
   defp format_runtime_seconds(seconds) when is_number(seconds) do
     whole_seconds = max(trunc(seconds), 0)

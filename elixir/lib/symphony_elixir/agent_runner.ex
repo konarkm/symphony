@@ -203,6 +203,7 @@ defmodule SymphonyElixir.AgentRunner do
     - If no reply is useful, make no text reply.
     - If the comments request work, first move the issue to Rework, then do the requested work, validate, update the compact Symphony Status comment, and move the issue back to Human Review.
     - Work can be code, repo maintenance, documentation, investigation, or other task execution. Use judgment.
+    - Attach generated files, screenshots, videos, images, logs, and other artifacts with `linear_upload_file` instead of pasting long text.
     - Natural approval comments do not trigger merging. Only the Merging state can trigger landing.
     - Keep replies and status updates short.
     """

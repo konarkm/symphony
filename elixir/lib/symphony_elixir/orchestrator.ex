@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
-  alias SymphonyElixir.Linear.{CommentSteering, Issue}
+  alias SymphonyElixir.Linear.{BridgeCommand, CommentSteering, Issue}
 
   @continuation_retry_delay_ms 1_000
   @comment_poll_interval_ms 5_000
@@ -37,6 +37,11 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_token,
       :comment_timer_ref,
       :comment_poll_token,
+      :last_linear_comment_poll_at,
+      :last_successful_comment_poll_at,
+      :last_linear_comment_poll_error,
+      :last_bridge_command,
+      watched_human_review_count: 0,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -699,7 +704,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil, runner_opts \\ []) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host, runner_opts)
+        if issue_paused_by_marker?(refreshed_issue) do
+          Logger.info("Skipping dispatch for paused issue: #{issue_context(refreshed_issue)}")
+          state
+        else
+          do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host, runner_opts)
+        end
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
@@ -1022,10 +1032,20 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, release_issue_claim(state, issue_id)}
 
       review_comment_retry?(metadata) and waiting_for_human_review_state?(issue.state) ->
-        handle_review_comment_retry(state, issue, attempt, metadata)
+        if issue_paused_by_marker?(issue) do
+          Logger.info("Skipping Human Review retry for paused issue: issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
+          {:noreply, release_issue_claim(state, issue_id)}
+        else
+          handle_review_comment_retry(state, issue, attempt, metadata)
+        end
 
       retry_candidate_issue?(issue, terminal_states) ->
-        handle_active_retry(state, issue, attempt, metadata)
+        if issue_paused_by_marker?(issue) do
+          Logger.info("Skipping active retry for paused issue: issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
+          {:noreply, release_issue_claim(state, issue_id)}
+        else
+          handle_active_retry(state, issue, attempt, metadata)
+        end
 
       true ->
         Logger.debug("Issue left active states, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
@@ -1048,10 +1068,26 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
 
   defp poll_comment_steering(%State{} = state) do
-    state
-    |> poll_running_issue_comments()
-    |> poll_retrying_issue_comments()
-    |> poll_human_review_issue_comments()
+    started_at = DateTime.utc_now()
+
+    try do
+      state
+      |> Map.put(:last_linear_comment_poll_at, started_at)
+      |> Map.put(:last_linear_comment_poll_error, nil)
+      |> poll_running_issue_comments()
+      |> poll_retrying_issue_comments()
+      |> poll_human_review_issue_comments()
+      |> Map.put(:last_successful_comment_poll_at, DateTime.utc_now())
+    rescue
+      exception ->
+        Logger.warning("Linear comment polling failed: #{Exception.message(exception)}")
+
+        %{
+          state
+          | last_linear_comment_poll_at: started_at,
+            last_linear_comment_poll_error: Exception.message(exception)
+        }
+    end
   end
 
   defp poll_running_issue_comments(%State{} = state) do
@@ -1075,11 +1111,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp poll_human_review_issue_comments(%State{} = state) do
     case Tracker.fetch_issues_by_states([@human_review_state]) do
       {:ok, issues} when is_list(issues) ->
-        Enum.reduce(issues, state, &poll_human_review_issue_comment/2)
+        issues
+        |> Enum.reduce(%{state | watched_human_review_count: length(issues)}, &poll_human_review_issue_comment/2)
 
       {:error, reason} ->
         Logger.debug("Failed to fetch Human Review issues for Linear comment polling: #{inspect(reason)}")
-        state
+        %{state | last_linear_comment_poll_error: inspect(reason)}
     end
   end
 
@@ -1110,6 +1147,25 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp issue_paused_by_marker?(%Issue{id: issue_id}) when is_binary(issue_id) do
+    case Tracker.fetch_issue_comments(issue_id) do
+      {:ok, comments} ->
+        comments
+        |> CommentSteering.find_status_comment()
+        |> CommentSteering.marker_from_comment()
+        |> case do
+          {:ok, marker} -> CommentSteering.paused?(marker)
+          _ -> false
+        end
+
+      {:error, reason} ->
+        Logger.debug("Unable to read pause marker for issue_id=#{issue_id}: #{inspect(reason)}")
+        false
+    end
+  end
+
+  defp issue_paused_by_marker?(_issue), do: false
+
   defp handle_issue_comments(state, issue_id, issue, entry, comments) when is_list(comments) do
     status_comment = CommentSteering.find_status_comment(comments)
     marker_state = CommentSteering.marker_from_comment(status_comment)
@@ -1128,20 +1184,226 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       true ->
-        Enum.each(actionable_comments, &acknowledge_comment/1)
+        process_actionable_comments_in_order(
+          state,
+          issue_id,
+          issue,
+          entry,
+          status_comment,
+          marker_state,
+          actionable_comments
+        )
+    end
+  end
+
+  defp process_actionable_comments_in_order(state, issue_id, issue, entry, status_comment, {:ok, marker}, comments) do
+    accumulator = %{
+      state: state,
+      marker: marker,
+      worker_comments: [],
+      command_count: 0,
+      worker_count: 0,
+      paused_count: 0
+    }
+
+    comments
+    |> Enum.reduce(accumulator, fn comment, acc ->
+      if BridgeCommand.command?(comment) do
+        acc
+        |> flush_worker_comments(issue_id, issue, entry)
+        |> process_bridge_command_comment(issue, status_comment, comment)
+      else
+        process_worker_comment(acc, issue, status_comment, comment)
+      end
+    end)
+    |> flush_worker_comments(issue_id, issue, entry)
+    |> Map.fetch!(:state)
+  end
+
+  defp process_actionable_comments_in_order(state, _issue_id, _issue, _entry, _status_comment, _marker_state, _comments), do: state
+
+  defp process_bridge_command_comment(acc, %Issue{} = issue, status_comment, comment) do
+    case BridgeCommand.parse(comment) do
+      {:ok, command} ->
+        acknowledge_comment(comment)
+        {state, reply, paused?} = apply_bridge_command(acc.state, issue, command, acc.marker)
 
         marker =
-          actionable_comments
-          |> List.last()
-          |> CommentSteering.marker_for_comment()
+          acc.marker
+          |> CommentSteering.advance_marker(comment)
+          |> CommentSteering.put_command(command.action_text, comment.id, paused: paused?)
 
-        steering_message = CommentSteering.format_steering_message(actionable_comments)
+        case upsert_status_comment(issue, status_comment, marker, last_update: "Saw Symphony command `#{command.action_text}`.") do
+          :ok ->
+            reply_to_bridge_command(issue, comment, reply)
 
-        :ok =
-          upsert_status_comment(issue, status_comment, marker, last_update: "Saw #{length(actionable_comments)} new Linear comment(s).")
+            %{
+              acc
+              | state: %{state | last_bridge_command: bridge_command_snapshot(issue, comment, command)},
+                marker: marker,
+                command_count: acc.command_count + 1
+            }
 
-        route_comment_steering(state, issue_id, issue, entry, actionable_comments, steering_message)
+          {:error, reason} ->
+            Logger.warning("Skipping Symphony command side effects after marker write failure for #{issue_context(issue)}: #{inspect(reason)}")
+            acc
+        end
+
+      {:error, :unknown_command, unknown} ->
+        acknowledge_comment(comment)
+
+        marker =
+          acc.marker
+          |> CommentSteering.advance_marker(comment)
+          |> CommentSteering.put_command("unknown", comment.id, paused: CommentSteering.paused?(acc.marker))
+
+        case upsert_status_comment(issue, status_comment, marker, last_update: "Saw unknown Symphony command.") do
+          :ok ->
+            reply_to_bridge_command(issue, comment, "Unknown Symphony command `#{unknown}`. #{BridgeCommand.help_text()}")
+
+            %{
+              acc
+              | state: %{
+                  acc.state
+                  | last_bridge_command: %{
+                      issue_id: issue.id,
+                      issue_identifier: issue.identifier,
+                      comment_id: comment.id,
+                      command: "unknown",
+                      at: DateTime.utc_now()
+                    }
+                },
+                marker: marker,
+                command_count: acc.command_count + 1
+            }
+
+          {:error, reason} ->
+            Logger.warning("Skipping unknown Symphony command reply after marker write failure for #{issue_context(issue)}: #{inspect(reason)}")
+            acc
+        end
+
+      :not_command ->
+        acc
     end
+  end
+
+  defp process_worker_comment(acc, %Issue{} = issue, status_comment, comment) do
+    acknowledge_comment(comment)
+    marker = CommentSteering.advance_marker(acc.marker, comment)
+    paused? = CommentSteering.paused?(marker)
+
+    case upsert_status_comment(issue, status_comment, marker,
+           last_update:
+             if(paused?,
+               do: "Saw a non-command comment while paused.",
+               else: "Saw a worker-routed Linear comment."
+             )
+         ) do
+      :ok ->
+        if paused? do
+          Logger.info("Issue is paused; acknowledged non-command Linear comment without worker routing for #{issue_context(issue)}")
+          %{acc | marker: marker, worker_count: acc.worker_count + 1, paused_count: acc.paused_count + 1}
+        else
+          %{acc | marker: marker, worker_comments: acc.worker_comments ++ [comment], worker_count: acc.worker_count + 1}
+        end
+
+      {:error, reason} ->
+        Logger.warning("Skipping Linear comment routing after marker write failure for #{issue_context(issue)}: #{inspect(reason)}")
+        acc
+    end
+  end
+
+  defp flush_worker_comments(%{worker_comments: []} = acc, _issue_id, _issue, _entry), do: acc
+
+  defp flush_worker_comments(%{worker_comments: worker_comments} = acc, issue_id, issue, entry) do
+    steering_message = CommentSteering.format_steering_message(worker_comments)
+    state = route_comment_steering(acc.state, issue_id, issue, entry, worker_comments, steering_message)
+    %{acc | state: state, worker_comments: []}
+  end
+
+  defp apply_bridge_command(%State{} = state, _issue, %{action: :help}, marker) do
+    {state, BridgeCommand.help_text(), CommentSteering.paused?(marker)}
+  end
+
+  defp apply_bridge_command(%State{} = state, %Issue{} = issue, %{action: :status}, marker) do
+    paused? = CommentSteering.paused?(marker)
+
+    reply =
+      [
+        "Status: #{issue.state || "Unknown"}.",
+        if(paused?, do: "Paused: yes.", else: "Paused: no."),
+        if(Map.has_key?(state.running, issue.id), do: "Run: active.", else: nil),
+        if(Map.has_key?(state.retry_attempts, issue.id), do: "Retry: queued.", else: nil)
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join(" ")
+
+    {state, reply, paused?}
+  end
+
+  defp apply_bridge_command(%State{} = state, %Issue{} = issue, %{action: :pause}, _marker) do
+    state = stop_issue_runtime(state, issue.id)
+    {state, "Paused. I will keep acknowledging comments, but will not route non-command comments until `symphony resume`.", true}
+  end
+
+  defp apply_bridge_command(%State{} = state, _issue, %{action: :resume}, _marker) do
+    {state, "Resumed. New non-command comments can route to the worker again.", false}
+  end
+
+  defp apply_bridge_command(%State{} = state, %Issue{} = issue, %{action: :cancel}, _marker) do
+    state = stop_issue_runtime(state, issue.id)
+    {state, "Canceled the active Symphony runtime for this issue and left the workspace intact. Use `symphony resume` when you want routing again.", true}
+  end
+
+  defp apply_bridge_command(%State{} = state, %Issue{} = issue, %{action: :retry}, marker) do
+    case Map.get(state.retry_attempts, issue.id) do
+      %{retry_token: retry_token} = retry_entry ->
+        if is_reference(Map.get(retry_entry, :timer_ref)) do
+          Process.cancel_timer(retry_entry.timer_ref)
+        end
+
+        Process.send_after(self(), {:retry_issue, issue.id, retry_token}, 0)
+        {state, "Retry queued now.", CommentSteering.paused?(marker)}
+
+      _ ->
+        {state, "No retry is queued for this issue right now.", CommentSteering.paused?(marker)}
+    end
+  end
+
+  defp reply_to_bridge_command(%Issue{id: issue_id}, %{id: comment_id}, body)
+       when is_binary(issue_id) and is_binary(comment_id) and is_binary(body) do
+    case Tracker.create_comment_reply(issue_id, comment_id, body) do
+      :ok -> :ok
+      {:error, reason} -> Logger.debug("Unable to reply to Symphony bridge command #{comment_id}: #{inspect(reason)}")
+    end
+  end
+
+  defp reply_to_bridge_command(_issue, _comment, _body), do: :ok
+
+  defp bridge_command_snapshot(%Issue{} = issue, comment, command) do
+    %{
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      comment_id: comment.id,
+      command: command.action_text,
+      at: DateTime.utc_now()
+    }
+  end
+
+  defp stop_issue_runtime(%State{} = state, issue_id) when is_binary(issue_id) do
+    state
+    |> terminate_running_issue(issue_id, false)
+    |> cancel_retry(issue_id)
+    |> release_issue_claim(issue_id)
+  end
+
+  defp cancel_retry(%State{} = state, issue_id) when is_binary(issue_id) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{timer_ref: timer_ref} when is_reference(timer_ref) -> Process.cancel_timer(timer_ref)
+      _ -> :ok
+    end
+
+    %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
   end
 
   defp acknowledge_comment(%{id: comment_id}) when is_binary(comment_id) do
@@ -1154,8 +1416,6 @@ defmodule SymphonyElixir.Orchestrator do
         :ok
     end
   end
-
-  defp acknowledge_comment(_comment), do: :ok
 
   defp upsert_status_comment(%Issue{id: issue_id} = issue, status_comment, marker, opts)
        when is_binary(issue_id) and is_map(marker) do
@@ -1178,7 +1438,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp log_status_comment_error(issue, operation, reason) do
     Logger.debug("Unable to #{operation} Symphony status comment for #{issue_context(issue)}: #{inspect(reason)}")
-    :ok
+    {:error, reason}
   end
 
   defp route_comment_steering(%State{} = state, issue_id, %Issue{} = issue, {:running, %{mode: :review_comment}}, comments, message) do
@@ -1567,12 +1827,25 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    paused_issue_ids = paused_issue_ids_from_runtime(state)
+
     {:reply,
      %{
        running: running,
        retrying: retrying,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       bridge: %{
+         paused_issue_ids: paused_issue_ids,
+         paused_count: length(paused_issue_ids),
+         last_command: bridge_command_snapshot_for_payload(state.last_bridge_command)
+       },
+       comment_polling: %{
+         last_poll_at: state.last_linear_comment_poll_at,
+         last_successful_poll_at: state.last_successful_comment_poll_at,
+         last_error: state.last_linear_comment_poll_error,
+         watched_human_review_count: state.watched_human_review_count
+       },
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -1595,6 +1868,32 @@ defmodule SymphonyElixir.Orchestrator do
        operations: ["poll", "reconcile"]
      }, state}
   end
+
+  defp paused_issue_ids_from_runtime(%State{} = state) do
+    []
+    |> Kernel.++(paused_issue_ids_from_entries(state.running))
+    |> Kernel.++(paused_issue_ids_from_entries(state.retry_attempts))
+    |> Enum.uniq()
+  end
+
+  defp paused_issue_ids_from_entries(entries) when is_map(entries) do
+    entries
+    |> Enum.flat_map(fn
+      {issue_id, %{issue: %Issue{} = issue}} ->
+        if issue_paused_by_marker?(issue), do: [issue_id], else: []
+
+      _ ->
+        []
+    end)
+  end
+
+  defp bridge_command_snapshot_for_payload(nil), do: nil
+
+  defp bridge_command_snapshot_for_payload(%{at: %DateTime{} = at} = command) do
+    %{command | at: DateTime.to_iso8601(at)}
+  end
+
+  defp bridge_command_snapshot_for_payload(command), do: command
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)

@@ -12,7 +12,11 @@ defmodule SymphonyElixir.Linear.CommentSteering do
 
   @type marker :: %{
           optional(:last_seen_comment_id) => String.t(),
-          optional(:last_seen_comment_updated_at) => String.t()
+          optional(:last_seen_comment_updated_at) => String.t(),
+          optional(:paused) => boolean(),
+          optional(:last_command) => String.t() | nil,
+          optional(:last_command_comment_id) => String.t() | nil,
+          optional(:last_command_at) => String.t() | nil
         }
 
   @spec status_heading() :: String.t()
@@ -65,9 +69,31 @@ defmodule SymphonyElixir.Linear.CommentSteering do
   def marker_for_comment(%Comment{id: id} = comment) do
     %{
       last_seen_comment_id: id,
-      last_seen_comment_updated_at: comment_timestamp_iso8601(comment)
+      last_seen_comment_updated_at: comment_timestamp_iso8601(comment),
+      paused: false
     }
   end
+
+  @spec advance_marker(marker(), Comment.t()) :: marker()
+  def advance_marker(marker, %Comment{} = comment) when is_map(marker) do
+    marker
+    |> Map.merge(marker_for_comment(comment))
+    |> Map.put(:paused, paused?(marker))
+  end
+
+  @spec put_command(marker(), String.t(), String.t(), keyword()) :: marker()
+  def put_command(marker, command, comment_id, opts \\ [])
+      when is_map(marker) and is_binary(command) and is_binary(comment_id) do
+    marker
+    |> Map.put(:last_command, command)
+    |> Map.put(:last_command_comment_id, comment_id)
+    |> Map.put(:last_command_at, Keyword.get(opts, :at, DateTime.utc_now()) |> iso8601_value())
+    |> maybe_put_paused(Keyword.fetch(opts, :paused))
+  end
+
+  @spec paused?(marker() | term()) :: boolean()
+  def paused?(%{paused: true}), do: true
+  def paused?(_marker), do: false
 
   @spec latest_marker([Comment.t()]) :: marker()
   def latest_marker(comments) when is_list(comments) do
@@ -78,7 +104,8 @@ defmodule SymphonyElixir.Linear.CommentSteering do
       nil ->
         %{
           last_seen_comment_id: "",
-          last_seen_comment_updated_at: DateTime.to_iso8601(DateTime.utc_now())
+          last_seen_comment_updated_at: DateTime.to_iso8601(DateTime.utc_now()),
+          paused: false
         }
     end
   end
@@ -162,8 +189,14 @@ defmodule SymphonyElixir.Linear.CommentSteering do
   defp normalize_marker(marker) when is_map(marker) do
     %{
       last_seen_comment_id: Map.get(marker, "last_seen_comment_id") || Map.get(marker, :last_seen_comment_id),
-      last_seen_comment_updated_at: Map.get(marker, "last_seen_comment_updated_at") || Map.get(marker, :last_seen_comment_updated_at)
+      last_seen_comment_updated_at: Map.get(marker, "last_seen_comment_updated_at") || Map.get(marker, :last_seen_comment_updated_at),
+      paused: boolean_marker_value(Map.get(marker, "paused") || Map.get(marker, :paused)),
+      last_command: Map.get(marker, "last_command") || Map.get(marker, :last_command),
+      last_command_comment_id: Map.get(marker, "last_command_comment_id") || Map.get(marker, :last_command_comment_id),
+      last_command_at: Map.get(marker, "last_command_at") || Map.get(marker, :last_command_at)
     }
+    |> Enum.reject(fn {key, value} -> key != :paused and is_nil(value) end)
+    |> Map.new()
   end
 
   defp valid_marker?(%{last_seen_comment_id: id, last_seen_comment_updated_at: updated_at})
@@ -180,11 +213,31 @@ defmodule SymphonyElixir.Linear.CommentSteering do
   defp marker_comment(marker) when is_map(marker) do
     encoded_marker =
       marker
-      |> Map.take([:last_seen_comment_id, :last_seen_comment_updated_at])
+      |> Map.take([
+        :last_seen_comment_id,
+        :last_seen_comment_updated_at,
+        :paused,
+        :last_command,
+        :last_command_comment_id,
+        :last_command_at
+      ])
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+      |> Map.new()
       |> Jason.encode!()
 
     @marker_prefix <> encoded_marker <> @marker_suffix
   end
+
+  defp maybe_put_paused(marker, {:ok, paused}) when is_boolean(paused), do: Map.put(marker, :paused, paused)
+  defp maybe_put_paused(marker, _paused), do: marker
+
+  defp boolean_marker_value(true), do: true
+  defp boolean_marker_value("true"), do: true
+  defp boolean_marker_value(_value), do: false
+
+  defp iso8601_value(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
+  defp iso8601_value(value) when is_binary(value), do: value
+  defp iso8601_value(_value), do: DateTime.to_iso8601(DateTime.utc_now())
 
   defp ignored_comment?(%Comment{author_is_bot: true}), do: true
   defp ignored_comment?(%Comment{parent_id: parent_id}) when is_binary(parent_id), do: true
@@ -202,6 +255,14 @@ defmodule SymphonyElixir.Linear.CommentSteering do
   end
 
   defp newer_than_marker?(%Comment{} = comment, marker) do
+    if comment.id == marker[:last_seen_comment_id] do
+      false
+    else
+      newer_comment_than_marker?(comment, marker)
+    end
+  end
+
+  defp newer_comment_than_marker?(%Comment{} = comment, marker) do
     with %DateTime{} = comment_time <- comment_timestamp(comment),
          marker_time when is_binary(marker_time) <- marker[:last_seen_comment_updated_at],
          {:ok, marker_datetime, _offset} <- DateTime.from_iso8601(marker_time) do
@@ -222,8 +283,8 @@ defmodule SymphonyElixir.Linear.CommentSteering do
     end
   end
 
-  defp comment_timestamp(%Comment{updated_at: %DateTime{} = updated_at}), do: updated_at
   defp comment_timestamp(%Comment{created_at: %DateTime{} = created_at}), do: created_at
+  defp comment_timestamp(%Comment{updated_at: %DateTime{} = updated_at}), do: updated_at
   defp comment_timestamp(_comment), do: nil
 
   defp sort_comments(comments) when is_list(comments) do

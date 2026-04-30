@@ -500,6 +500,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "worker_host" => nil,
                  "workspace_path" => nil,
                  "session_id" => "thread-http",
+                 "mode" => "normal",
+                 "pending_review_comment_count" => 0,
                  "turn_count" => 7,
                  "last_event" => "notification",
                  "last_message" => "rendered",
@@ -525,7 +527,15 @@ defmodule SymphonyElixir.ExtensionsTest do
                "total_tokens" => 12,
                "seconds_running" => 42.5
              },
-             "rate_limits" => %{"primary" => %{"remaining" => 11}}
+             "rate_limits" => %{"primary" => %{"remaining" => 11}},
+             "polling" => %{"checking?" => false, "next_poll_in_ms" => nil, "poll_interval_ms" => nil},
+             "comment_polling" => %{
+               "last_poll_at" => nil,
+               "last_successful_poll_at" => nil,
+               "last_error" => nil,
+               "watched_human_review_count" => 0
+             },
+             "bridge" => %{"paused_issue_ids" => [], "paused_count" => 0, "last_command" => nil}
            }
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")

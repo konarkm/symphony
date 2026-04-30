@@ -351,7 +351,27 @@ query IssueFieldArgs {
 }
 ```
 
-### Upload a video to a comment
+### Upload a file to a comment
+
+Prefer the first-class `linear_upload_file` tool when it is available. It
+validates the local path, uploads the file with Linear `fileUpload`, and creates
+or updates the relevant comment with the resulting asset URL.
+
+Example:
+
+```json
+{
+  "path": "artifacts/demo.mp4",
+  "issueId": "issue-id",
+  "parentId": "comment-id",
+  "body": "Attached the demo recording."
+}
+```
+
+Use `linear_download_file` for accessible Linear asset URLs that need to be
+downloaded into the active issue workspace.
+
+### Manual upload fallback
 
 Do this in three steps:
 
