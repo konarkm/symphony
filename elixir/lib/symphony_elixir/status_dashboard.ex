@@ -589,7 +589,7 @@ defmodule SymphonyElixir.StatusDashboard do
   # credo:disable-for-next-line
   defp format_running_summary(running_entry, running_event_width) do
     issue = format_cell(running_entry.identifier || "unknown", @running_id_width)
-    state = running_entry.state || "unknown"
+    state = running_stage_label(running_entry)
     state_display = format_cell(to_string(state), @running_stage_width)
     session = running_entry.session_id |> compact_session_id() |> format_cell(@running_session_width)
     pid = format_cell(running_entry.codex_app_server_pid || "n/a", @running_pid_width)
@@ -636,6 +636,10 @@ defmodule SymphonyElixir.StatusDashboard do
   @spec format_running_summary_for_test(map(), integer() | nil) :: String.t()
   def format_running_summary_for_test(running_entry, terminal_columns \\ nil),
     do: format_running_summary(running_entry, running_event_width(terminal_columns))
+
+  defp running_stage_label(%{mode: :review_comment}), do: "Review Run"
+  defp running_stage_label(%{mode: "review_comment"}), do: "Review Run"
+  defp running_stage_label(running_entry), do: running_entry.state || "unknown"
 
   @doc false
   @spec format_tps_for_test(number()) :: String.t()
