@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Linear.Agent do
   Linear AgentSession helpers and webhook normalization.
   """
 
-  alias SymphonyElixir.Linear.{Client, Issue}
+  alias SymphonyElixir.Linear.{Client, Comment, Issue}
 
   @activity_mutation """
   mutation SymphonyAgentActivityCreate($input: AgentActivityCreateInput!) {
@@ -45,6 +45,7 @@ defmodule SymphonyElixir.Linear.Agent do
           agent_session_id: String.t() | nil,
           prompt_context: String.t() | nil,
           prompt_body: String.t() | nil,
+          comment: Comment.t() | nil,
           issue: Issue.t() | nil,
           raw: map()
         }
@@ -57,6 +58,7 @@ defmodule SymphonyElixir.Linear.Agent do
        agent_session_id: payload |> webhook_session() |> string_at(["id"]),
        prompt_context: webhook_prompt_context(payload),
        prompt_body: payload |> webhook_activity() |> activity_body(),
+       comment: normalize_comment(payload),
        issue: payload |> webhook_issue() |> normalize_issue(),
        raw: payload
      }}
@@ -112,7 +114,11 @@ defmodule SymphonyElixir.Linear.Agent do
 
   defp webhook_issue(payload) do
     session = webhook_session(payload)
-    map_at(session, ["issue"]) || map_at(payload, ["issue"]) || map_at(payload, ["data", "issue"])
+
+    map_at(session, ["issue"]) ||
+      map_at(payload, ["issue"]) ||
+      map_at(payload, ["data", "issue"]) ||
+      map_at(payload, ["notification", "issue"])
   end
 
   defp webhook_prompt_context(payload) do
@@ -121,6 +127,29 @@ defmodule SymphonyElixir.Linear.Agent do
 
   defp activity_body(activity) do
     string_at(activity, ["body"]) || string_at(activity, ["content", "body"])
+  end
+
+  defp normalize_comment(%{} = payload) do
+    with %{} = notification <- map_at(payload, ["notification"]),
+         %{} = comment <- map_at(notification, ["comment"]),
+         id when is_binary(id) <- string_at(comment, ["id"]) do
+      actor = map_at(notification, ["actor"]) || %{}
+      app_user_id = string_at(payload, ["appUserId"])
+      author_id = string_at(comment, ["userId"]) || string_at(notification, ["actorId"])
+
+      %Comment{
+        id: id,
+        body: string_at(comment, ["body"]),
+        created_at: parse_datetime(string_at(comment, ["createdAt"]) || string_at(notification, ["createdAt"])),
+        updated_at: parse_datetime(string_at(comment, ["updatedAt"]) || string_at(notification, ["updatedAt"])),
+        author_id: author_id,
+        author_name: string_at(actor, ["name"]),
+        parent_id: string_at(notification, ["parentCommentId"]) || string_at(comment, ["parentId"]),
+        author_is_bot: is_binary(app_user_id) and author_id == app_user_id
+      }
+    else
+      _ -> nil
+    end
   end
 
   defp missing_statuses_for_team(%{"name" => team_name, "states" => %{"nodes" => states}}, required_statuses) do

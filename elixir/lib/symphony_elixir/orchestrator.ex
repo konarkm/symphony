@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StateStore, StatusDashboard, Tracker, Workspace}
-  alias SymphonyElixir.Linear.{Agent, BridgeCommand, CommentSteering, Issue}
+  alias SymphonyElixir.Linear.{Agent, BridgeCommand, Comment, CommentSteering, Issue}
 
   @continuation_retry_delay_ms 1_000
   @comment_poll_interval_ms 5_000
@@ -393,7 +393,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, true)
 
-      waiting_for_human_review_state?(issue.state) and review_comment_worker_running?(state, issue.id) ->
+      waiting_for_human_review_state?(issue.state) and human_review_worker_continues?(state, issue.id) ->
         refresh_running_issue_state(state, issue)
 
       waiting_for_human_review_state?(issue.state) ->
@@ -747,6 +747,30 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp handle_linear_agent_session_event(
+         %State{} = state,
+         %{action: "issueNewComment", issue: %Issue{} = issue, comment: %Comment{} = comment} = event
+       ) do
+    issue = refresh_linear_agent_issue(issue)
+    event = Map.put(event, :issue, issue)
+
+    cond do
+      not top_level_human_comment?(comment) ->
+        state
+
+      BridgeCommand.command?(comment) ->
+        handle_linear_agent_bridge_command(state, issue, comment)
+
+      linear_agent_issue_paused?(issue.id) ->
+        acknowledge_comment(comment)
+        Logger.info("Issue is paused; acknowledged Linear Agent issue comment without worker routing for #{issue_context(issue)}")
+        state
+
+      true ->
+        handle_linear_agent_issue_comment(state, issue, comment, event)
+    end
+  end
+
   defp handle_linear_agent_session_event(%State{} = state, %{issue: %Issue{} = issue} = event) do
     issue = refresh_linear_agent_issue(issue)
     event = Map.put(event, :issue, issue)
@@ -757,28 +781,11 @@ defmodule SymphonyElixir.Orchestrator do
         prompt = linear_agent_prompt(event)
 
         case Map.get(state.running, issue.id) do
-          %{pid: pid, active_turn_id: active_turn_id} when is_pid(pid) and is_binary(active_turn_id) ->
-            send(pid, {:symphony_steer, prompt})
-            state
+          %{pid: pid} = running_entry when is_pid(pid) ->
+            handle_existing_linear_agent_process(state, issue, event, action, agent_session_id, running_entry, prompt)
 
           _ ->
-            acknowledge_agent_session(agent_session_id, action)
-
-            issue_state = StateStore.get_issue(issue.id)
-
-            runner_opts =
-              [
-                mode: :linear_agent,
-                linear_agent: true,
-                agent_session_id: agent_session_id,
-                prompt_context: Map.get(event, :prompt_context),
-                prompt_body: Map.get(event, :prompt_body),
-                existing_thread_id: Map.get(issue_state, "thread_id")
-              ]
-
-            state
-            |> release_issue_claim(issue.id)
-            |> do_dispatch_issue(%{issue | assigned_to_worker: true}, nil, nil, runner_opts)
+            dispatch_linear_agent_session_event(state, issue, event, action, agent_session_id)
         end
 
       _ ->
@@ -791,6 +798,184 @@ defmodule SymphonyElixir.Orchestrator do
     Logger.warning("Ignoring Linear AgentSession event without issue: #{inspect(Map.take(event, [:action, :agent_session_id]))}")
     state
   end
+
+  defp handle_linear_agent_bridge_command(%State{} = state, %Issue{} = issue, %Comment{} = comment) do
+    case BridgeCommand.parse(comment) do
+      {:ok, command} ->
+        apply_linear_agent_bridge_command(state, issue, comment, command)
+
+      {:error, :unknown_command, unknown} ->
+        apply_unknown_linear_agent_bridge_command(state, issue, comment, unknown)
+
+      :not_command ->
+        state
+    end
+  end
+
+  defp apply_unknown_linear_agent_bridge_command(%State{} = state, %Issue{} = issue, %Comment{} = comment, unknown) do
+    issue_state = StateStore.get_issue(issue.id)
+
+    if Map.get(issue_state, "last_command_comment_id") == comment.id do
+      state
+    else
+      case StateStore.put_issue(issue.id, %{
+             last_command: "unknown",
+             last_command_comment_id: comment.id,
+             last_command_at: DateTime.to_iso8601(DateTime.utc_now())
+           }) do
+        :ok ->
+          acknowledge_comment(comment)
+          reply_to_bridge_command(issue, comment, "Unknown Symphony command `#{unknown}`. #{BridgeCommand.help_text()}")
+
+          %{
+            state
+            | last_bridge_command: %{
+                issue_id: issue.id,
+                issue_identifier: issue.identifier,
+                comment_id: comment.id,
+                command: "unknown",
+                at: DateTime.utc_now()
+              }
+          }
+
+        {:error, reason} ->
+          Logger.warning("Unable to persist Linear Agent bridge command marker for #{issue_context(issue)} comment_id=#{comment.id}: #{inspect(reason)}")
+          state
+      end
+    end
+  end
+
+  defp apply_linear_agent_bridge_command(%State{} = state, %Issue{} = issue, %Comment{} = comment, command) do
+    issue_state = StateStore.get_issue(issue.id)
+
+    if Map.get(issue_state, "last_command_comment_id") == comment.id do
+      state
+    else
+      marker = %{paused: Map.get(issue_state, "paused") == true}
+      paused? = bridge_command_paused_after(command, marker)
+
+      case StateStore.put_issue(issue.id, %{
+             paused: paused?,
+             last_command: command.action_text,
+             last_command_comment_id: comment.id,
+             last_command_at: DateTime.to_iso8601(DateTime.utc_now())
+           }) do
+        :ok ->
+          acknowledge_comment(comment)
+          {state, reply, _paused?} = apply_bridge_command(state, issue, command, marker)
+          reply_to_bridge_command(issue, comment, reply)
+          %{state | last_bridge_command: bridge_command_snapshot(issue, comment, command)}
+
+        {:error, reason} ->
+          Logger.warning("Unable to persist Linear Agent bridge command marker for #{issue_context(issue)} comment_id=#{comment.id}: #{inspect(reason)}")
+          state
+      end
+    end
+  end
+
+  defp bridge_command_paused_after(%{action: :pause}, _marker), do: true
+  defp bridge_command_paused_after(%{action: :cancel}, _marker), do: true
+  defp bridge_command_paused_after(%{action: :resume}, _marker), do: false
+  defp bridge_command_paused_after(_command, marker), do: CommentSteering.paused?(marker)
+
+  defp handle_linear_agent_issue_comment(%State{} = state, %Issue{} = issue, %Comment{} = comment, event) do
+    issue_state = StateStore.get_issue(issue.id)
+
+    agent_session_id =
+      Map.get(event, :agent_session_id) ||
+        Map.get(issue_state, "agent_session_id") ||
+        get_in(state.running, [issue.id, :agent_session_id])
+
+    if is_binary(agent_session_id) and agent_session_id != "" do
+      acknowledge_comment(comment)
+
+      handle_linear_agent_session_event(state, %{
+        event
+        | action: "prompted",
+          agent_session_id: agent_session_id,
+          prompt_body: linear_agent_comment_prompt(comment)
+      })
+    else
+      Logger.info("Ignoring non-command Linear issue comment without known AgentSession for #{issue_context(issue)} comment_id=#{comment.id}")
+      state
+    end
+  end
+
+  defp linear_agent_comment_prompt(%Comment{} = comment) do
+    author = comment.author_name || "A human"
+    body = comment.body || ""
+
+    """
+    New top-level Linear issue comment from #{author}:
+
+    #{body}
+    """
+  end
+
+  defp linear_agent_issue_paused?(issue_id) when is_binary(issue_id) do
+    StateStore.get_issue(issue_id)
+    |> Map.get("paused")
+    |> Kernel.==(true)
+  end
+
+  defp linear_agent_issue_paused?(_issue_id), do: false
+
+  defp top_level_human_comment?(%Comment{author_is_bot: true}), do: false
+  defp top_level_human_comment?(%Comment{parent_id: parent_id}) when is_binary(parent_id) and parent_id != "", do: false
+  defp top_level_human_comment?(%Comment{}), do: true
+
+  defp handle_existing_linear_agent_process(
+         state,
+         issue,
+         event,
+         action,
+         agent_session_id,
+         %{pid: pid} = running_entry,
+         prompt
+       ) do
+    if Process.alive?(pid) and linear_agent_turn_steerable?(running_entry) do
+      maybe_steer_running_linear_agent(pid, event, prompt)
+      state
+    else
+      dispatch_linear_agent_session_event(state, issue, event, action, agent_session_id)
+    end
+  end
+
+  defp linear_agent_turn_steerable?(%{active_turn_id: active_turn_id})
+       when is_binary(active_turn_id) and active_turn_id != "",
+       do: true
+
+  defp linear_agent_turn_steerable?(%{last_codex_event: event})
+       when event in [:turn_completed, :turn_failed, :turn_cancelled, :turn_ended_with_error],
+       do: false
+
+  defp linear_agent_turn_steerable?(_running_entry), do: true
+
+  defp dispatch_linear_agent_session_event(state, issue, event, action, agent_session_id) do
+    acknowledge_agent_session(agent_session_id, action)
+
+    runner_opts =
+      [
+        mode: :linear_agent,
+        linear_agent: true,
+        agent_session_id: agent_session_id,
+        prompt_context: Map.get(event, :prompt_context),
+        prompt_body: Map.get(event, :prompt_body),
+        existing_thread_id: StateStore.get_issue(issue.id) |> Map.get("thread_id")
+      ]
+
+    state
+    |> release_issue_claim(issue.id)
+    |> do_dispatch_issue(%{issue | assigned_to_worker: true}, nil, nil, runner_opts)
+  end
+
+  defp maybe_steer_running_linear_agent(pid, %{action: "prompted"}, prompt)
+       when is_pid(pid) and is_binary(prompt) and prompt != "" do
+    send(pid, {:symphony_steer, prompt})
+    :ok
+  end
+
+  defp maybe_steer_running_linear_agent(_pid, _event, _prompt), do: :ok
 
   defp refresh_linear_agent_issue(%Issue{id: issue_id} = issue) when is_binary(issue_id) and issue_id != "" do
     case Tracker.fetch_issue_states_by_ids([issue_id]) do
@@ -1057,6 +1242,7 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(issue_id) and is_binary(thread_id) do
     StateStore.put_issue(issue_id, %{
       thread_id: thread_id,
+      agent_session_id: Map.get(running_entry, :agent_session_id),
       identifier: Map.get(running_entry, :identifier),
       workspace_path: Map.get(running_entry, :workspace_path),
       updated_at: DateTime.to_iso8601(DateTime.utc_now())
@@ -1733,14 +1919,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp review_comment_retry?(metadata) when is_map(metadata), do: metadata[:mode] == :review_comment
 
-  defp review_comment_worker_running?(%State{} = state, issue_id) when is_binary(issue_id) do
+  defp human_review_worker_continues?(%State{} = state, issue_id) when is_binary(issue_id) do
     case Map.get(state.running, issue_id) do
-      %{mode: :review_comment} -> true
+      %{mode: mode} when mode in [:review_comment, :linear_agent] -> true
       _ -> false
     end
   end
 
-  defp review_comment_worker_running?(_state, _issue_id), do: false
+  defp human_review_worker_continues?(_state, _issue_id), do: false
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     cond do

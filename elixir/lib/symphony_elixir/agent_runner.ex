@@ -84,11 +84,54 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+    existing_thread_id = Keyword.get(opts, :existing_thread_id)
 
     start_opts =
       [worker_host: worker_host]
-      |> maybe_put_existing_thread_id(Keyword.get(opts, :existing_thread_id))
+      |> maybe_put_existing_thread_id(existing_thread_id)
 
+    result =
+      run_codex_session_with_opts(
+        workspace,
+        issue,
+        codex_update_recipient,
+        opts,
+        issue_state_fetcher,
+        max_turns,
+        start_opts
+      )
+
+    if retry_linear_agent_with_fresh_thread?(result, opts, existing_thread_id) do
+      Logger.warning("Linear Agent resumed thread was interrupted for #{issue_context(issue)}; retrying once with a fresh Codex thread")
+
+      run_codex_session_with_opts(
+        workspace,
+        issue,
+        codex_update_recipient,
+        opts,
+        issue_state_fetcher,
+        max_turns,
+        worker_host: worker_host
+      )
+    else
+      result
+    end
+  end
+
+  defp maybe_put_existing_thread_id(opts, thread_id) when is_binary(thread_id) and thread_id != "",
+    do: Keyword.put(opts, :thread_id, thread_id)
+
+  defp maybe_put_existing_thread_id(opts, _thread_id), do: opts
+
+  defp run_codex_session_with_opts(
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         max_turns,
+         start_opts
+       ) do
     with {:ok, session} <- AppServer.start_session(workspace, start_opts) do
       try do
         if Keyword.get(opts, :linear_agent) == true do
@@ -102,10 +145,21 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp maybe_put_existing_thread_id(opts, thread_id) when is_binary(thread_id) and thread_id != "",
-    do: Keyword.put(opts, :thread_id, thread_id)
+  defp retry_linear_agent_with_fresh_thread?({:error, {:turn_cancelled, params}}, opts, existing_thread_id) do
+    Keyword.get(opts, :linear_agent) == true and
+      is_binary(existing_thread_id) and
+      existing_thread_id != "" and
+      interrupted_turn_cancelled?(params)
+  end
 
-  defp maybe_put_existing_thread_id(opts, _thread_id), do: opts
+  defp retry_linear_agent_with_fresh_thread?(_result, _opts, _existing_thread_id), do: false
+
+  defp interrupted_turn_cancelled?(params) when is_map(params) do
+    reason = Map.get(params, "reason") || Map.get(params, :reason)
+    reason in ["interrupted", :interrupted]
+  end
+
+  defp interrupted_turn_cancelled?(_params), do: false
 
   defp run_single_linear_agent_turn(session, workspace, issue, codex_update_recipient, opts) do
     prompt = build_turn_prompt(issue, opts, 1, 1)

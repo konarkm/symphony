@@ -578,6 +578,50 @@ defmodule SymphonyElixir.CoreTest do
     send(agent_pid, :stop)
   end
 
+  test "linear agent worker stays running when prompted from human review" do
+    issue_id = "issue-linear-agent-review-worker"
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          mode: :linear_agent,
+          identifier: "MT-563",
+          issue: %Issue{id: issue_id, state: "Human Review", identifier: "MT-563"},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-563",
+      state: "Human Review",
+      title: "Review prompt run",
+      description: "Linear Agent worker should keep handling a review prompt",
+      labels: []
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    assert Map.has_key?(updated_state.running, issue_id)
+    assert MapSet.member?(updated_state.claimed, issue_id)
+    assert Process.alive?(agent_pid)
+
+    send(agent_pid, :stop)
+  end
+
   test "completed human review comment worker releases claim without continuation retry" do
     issue_id = "issue-review-complete"
     monitor_ref = make_ref()
@@ -1712,6 +1756,667 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "linear agent prompted event steers a starting issue room instead of dispatching duplicate worker" do
+    issue = %Issue{
+      id: "issue-linear-agent-starting",
+      identifier: "MT-252",
+      title: "Starting room",
+      description: "Prompt while the first turn is still starting",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-252",
+      labels: []
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      linear_agent_enabled: true
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :LinearAgentStartingRoomOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid, 15_000)
+    worker_ref = make_ref()
+
+    running_entry = %{
+      pid: self(),
+      ref: worker_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      thread_id: "thread-existing",
+      active_turn_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: DateTime.utc_now(),
+      mode: :linear_agent
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue.id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue.id))
+    end)
+
+    Orchestrator.handle_agent_session_event(
+      %{
+        action: "prompted",
+        agent_session_id: "agent-session-252",
+        prompt_body: "Please make the small review change.",
+        prompt_context: nil,
+        issue: issue
+      },
+      orchestrator_name
+    )
+
+    assert_receive {:symphony_steer, steering_prompt}, 1_000
+    assert steering_prompt =~ "Linear AgentSession event: prompted"
+    assert steering_prompt =~ "Please make the small review change."
+
+    updated_state = :sys.get_state(pid, 15_000)
+    assert Map.keys(updated_state.running) == [issue.id]
+    assert updated_state.running[issue.id].pid == self()
+    assert updated_state.running[issue.id].ref == worker_ref
+  end
+
+  test "linear agent prompted event dispatches next turn after previous turn completed" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-linear-agent-completed-turn-prompt-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(workspace_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$line" in
+          *'"id":1'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-after-complete"}}}'
+            ;;
+          *'"method":"turn/start"'*)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-after-complete"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      issue = %Issue{
+        id: "issue-linear-agent-completed-turn",
+        identifier: "MT-259",
+        title: "Completed turn prompt",
+        description: "Prompt after turn completion should start another turn",
+        state: "Human Review",
+        url: "https://example.org/issues/MT-259",
+        labels: []
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        linear_agent_enabled: true,
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        prompt: "Base issue prompt for {{ issue.identifier }}"
+      )
+
+      orchestrator_name = Module.concat(__MODULE__, :LinearAgentCompletedTurnOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+
+        File.rm_rf(test_root)
+      end)
+
+      initial_state = :sys.get_state(pid, 15_000)
+      worker_ref = make_ref()
+
+      running_entry = %{
+        pid: self(),
+        ref: worker_ref,
+        identifier: issue.identifier,
+        issue: issue,
+        session_id: "thread-existing-turn-completed",
+        thread_id: "thread-existing",
+        active_turn_id: nil,
+        turn_count: 1,
+        last_codex_message: "turn_completed",
+        last_codex_timestamp: DateTime.utc_now(),
+        last_codex_event: :turn_completed,
+        started_at: DateTime.utc_now(),
+        mode: :linear_agent,
+        agent_session_id: "agent-session-259"
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:running, %{issue.id => running_entry})
+        |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue.id))
+      end)
+
+      Orchestrator.handle_agent_session_event(
+        %{
+          action: "prompted",
+          agent_session_id: "agent-session-259",
+          prompt_body: "Please continue after the completed turn.",
+          prompt_context: nil,
+          issue: issue
+        },
+        orchestrator_name
+      )
+
+      refute_receive {:symphony_steer, _steering_prompt}, 100
+
+      eventually(fn ->
+        trace = if File.exists?(trace_file), do: File.read!(trace_file), else: ""
+        assert trace =~ "\"method\":\"turn/start\""
+        assert trace =~ "Please continue after the completed turn."
+      end)
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "linear agent webhook normalizes issue comment notifications" do
+    {:ok, event} =
+      SymphonyElixir.Linear.Agent.normalize_webhook(%{
+        "action" => "issueNewComment",
+        "appUserId" => "app-user-1",
+        "notification" => %{
+          "createdAt" => "2026-04-30T12:00:00Z",
+          "updatedAt" => "2026-04-30T12:00:01Z",
+          "actor" => %{"name" => "Konark M"},
+          "issue" => %{
+            "id" => "issue-agent-notification",
+            "identifier" => "MT-254",
+            "title" => "Notification issue",
+            "state" => %{"name" => "Human Review"}
+          },
+          "comment" => %{
+            "id" => "comment-agent-notification",
+            "body" => "symphony status",
+            "userId" => "human-user-1",
+            "createdAt" => "2026-04-30T12:00:00Z",
+            "updatedAt" => "2026-04-30T12:00:01Z"
+          }
+        }
+      })
+
+    assert event.action == "issueNewComment"
+    assert %Issue{id: "issue-agent-notification", identifier: "MT-254", state: "Human Review"} = event.issue
+
+    assert %Comment{
+             id: "comment-agent-notification",
+             body: "symphony status",
+             author_id: "human-user-1",
+             author_name: "Konark M",
+             author_is_bot: false,
+             parent_id: nil
+           } = event.comment
+  end
+
+  test "linear agent top-level bridge command replies without dispatching a worker" do
+    state_path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-linear-agent-command-state-#{System.unique_integer([:positive])}.json"
+      )
+
+    issue = %Issue{
+      id: "issue-linear-agent-command",
+      identifier: "MT-255",
+      title: "Command issue",
+      description: "Handle explicit command",
+      state: "Human Review",
+      labels: []
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      linear_agent_enabled: true,
+      linear_agent_state_path: state_path
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :LinearAgentBridgeCommandOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+
+      File.rm_rf(state_path)
+    end)
+
+    Orchestrator.handle_agent_session_event(
+      %{
+        action: "issueNewComment",
+        agent_session_id: nil,
+        prompt_body: nil,
+        prompt_context: nil,
+        issue: %{issue | state: nil},
+        comment: %Comment{
+          id: "linear-agent-command-status",
+          body: "symphony status",
+          author_name: "Konark M",
+          author_is_bot: false
+        }
+      },
+      orchestrator_name
+    )
+
+    assert_receive {:memory_tracker_comment_reaction, "linear-agent-command-status", "eyes"}
+    assert_receive {:memory_tracker_comment_reply, "issue-linear-agent-command", "linear-agent-command-status", reply}
+    assert reply =~ "Status: Human Review"
+    assert reply =~ "Paused: no"
+
+    updated_state = :sys.get_state(pid, 15_000)
+    issue_state = SymphonyElixir.StateStore.get_issue(issue.id)
+    assert issue_state["last_command"] == "status"
+    assert issue_state["last_command_comment_id"] == "linear-agent-command-status"
+
+    refute Map.has_key?(updated_state.running, issue.id)
+    assert %{command: "status", issue_identifier: "MT-255"} = updated_state.last_bridge_command
+  end
+
+  test "linear agent unknown bridge command is idempotent by comment id" do
+    state_path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-linear-agent-unknown-command-state-#{System.unique_integer([:positive])}.json"
+      )
+
+    issue = %Issue{
+      id: "issue-linear-agent-unknown-command",
+      identifier: "MT-257",
+      title: "Unknown command issue",
+      description: "Handle duplicate explicit command",
+      state: "Human Review",
+      labels: []
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      linear_agent_enabled: true,
+      linear_agent_state_path: state_path
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :LinearAgentUnknownCommandOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+
+      File.rm_rf(state_path)
+    end)
+
+    event = %{
+      action: "issueNewComment",
+      agent_session_id: nil,
+      prompt_body: nil,
+      prompt_context: nil,
+      issue: issue,
+      comment: %Comment{
+        id: "linear-agent-command-unknown",
+        body: "symphony dance",
+        author_name: "Konark M",
+        author_is_bot: false
+      }
+    }
+
+    Orchestrator.handle_agent_session_event(event, orchestrator_name)
+
+    assert_receive {:memory_tracker_comment_reaction, "linear-agent-command-unknown", "eyes"}
+    assert_receive {:memory_tracker_comment_reply, "issue-linear-agent-unknown-command", "linear-agent-command-unknown", reply}
+    assert reply =~ "Unknown Symphony command `dance`"
+
+    _updated_state = :sys.get_state(pid, 15_000)
+
+    Orchestrator.handle_agent_session_event(event, orchestrator_name)
+
+    refute_receive {:memory_tracker_comment_reaction, "linear-agent-command-unknown", "eyes"}, 100
+    refute_receive {:memory_tracker_comment_reply, _, _, _}, 100
+  end
+
+  test "linear agent top-level issue comment steers running session before state persistence and ignores bot replies" do
+    state_path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-linear-agent-comment-state-#{System.unique_integer([:positive])}.json"
+      )
+
+    issue = %Issue{
+      id: "issue-linear-agent-comment",
+      identifier: "MT-256",
+      title: "Comment issue",
+      description: "Route top-level comments",
+      state: "Human Review",
+      labels: []
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      linear_agent_enabled: true,
+      linear_agent_state_path: state_path
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :LinearAgentIssueCommentOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+
+      File.rm_rf(state_path)
+    end)
+
+    initial_state = :sys.get_state(pid, 15_000)
+    worker_ref = make_ref()
+
+    running_entry = %{
+      pid: self(),
+      ref: worker_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      thread_id: "thread-existing",
+      active_turn_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: DateTime.utc_now(),
+      mode: :linear_agent,
+      agent_session_id: "agent-session-256"
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue.id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue.id))
+    end)
+
+    Orchestrator.handle_agent_session_event(
+      %{
+        action: "issueNewComment",
+        agent_session_id: nil,
+        prompt_body: nil,
+        prompt_context: nil,
+        issue: issue,
+        comment: %Comment{
+          id: "linear-agent-human-comment",
+          body: "Please tighten the spacing.",
+          author_name: "Konark M",
+          author_is_bot: false
+        }
+      },
+      orchestrator_name
+    )
+
+    assert_receive {:memory_tracker_comment_reaction, "linear-agent-human-comment", "eyes"}
+    assert_receive {:symphony_steer, steering_prompt}, 1_000
+    assert steering_prompt =~ "Linear AgentSession event: prompted"
+    assert steering_prompt =~ "New top-level Linear issue comment from Konark M"
+    assert steering_prompt =~ "Please tighten the spacing."
+
+    Orchestrator.handle_agent_session_event(
+      %{
+        action: "issueNewComment",
+        agent_session_id: nil,
+        prompt_body: nil,
+        prompt_context: nil,
+        issue: issue,
+        comment: %Comment{
+          id: "linear-agent-reply-command",
+          body: "symphony status",
+          parent_id: "parent-comment",
+          author_name: "Konark M",
+          author_is_bot: false
+        }
+      },
+      orchestrator_name
+    )
+
+    Orchestrator.handle_agent_session_event(
+      %{
+        action: "issueNewComment",
+        agent_session_id: nil,
+        prompt_body: nil,
+        prompt_context: nil,
+        issue: issue,
+        comment: %Comment{
+          id: "linear-agent-bot-command",
+          body: "symphony status",
+          author_name: "Symphony",
+          author_is_bot: true
+        }
+      },
+      orchestrator_name
+    )
+
+    refute_receive {:memory_tracker_comment_reaction, "linear-agent-reply-command", "eyes"}, 100
+    refute_receive {:memory_tracker_comment_reaction, "linear-agent-bot-command", "eyes"}, 100
+    refute_receive {:memory_tracker_comment_reply, _, _, _}, 100
+  end
+
+  test "linear agent retries once with a fresh thread when resumed thread is interrupted" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-linear-agent-fresh-thread-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+      interrupted_marker = Path.join(test_root, "interrupted-once")
+
+      File.mkdir_p!(workspace_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      interrupted_marker="#{interrupted_marker}"
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$line" in
+          *'"id":1'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/resume"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"old-thread"}}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"new-thread"}}}'
+            ;;
+          *'"method":"turn/start"'*)
+            if [ ! -f "$interrupted_marker" ]; then
+              touch "$interrupted_marker"
+              printf '%s\\n' '{"id":3,"result":{"turn":{"id":"cancelled-turn"}}}'
+              printf '%s\\n' '{"method":"turn/cancelled","params":{"reason":"interrupted"}}'
+              exit 0
+            else
+              printf '%s\\n' '{"id":3,"result":{"turn":{"id":"new-turn"}}}'
+              printf '%s\\n' '{"method":"turn/completed"}'
+              exit 0
+            fi
+            ;;
+          *)
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        prompt: "Base issue prompt for {{ issue.identifier }}"
+      )
+
+      issue = %Issue{
+        id: "issue-linear-agent-fallback",
+        identifier: "MT-253",
+        title: "Recover interrupted thread",
+        description: "Retry on fresh thread",
+        state: "Human Review",
+        url: "https://example.org/issues/MT-253",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run(
+                 issue,
+                 nil,
+                 linear_agent: true,
+                 existing_thread_id: "old-thread",
+                 agent_session_id: "agent-session-253"
+               )
+
+      trace = File.read!(trace_file)
+      assert trace =~ "\"method\":\"thread/resume\""
+      assert trace =~ "\"threadId\":\"old-thread\""
+      assert trace =~ "\"method\":\"thread/start\""
+      assert trace =~ "Base issue prompt for MT-253"
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "linear agent does not retry a fresh thread for resumed turn failures" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-linear-agent-no-fresh-thread-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(workspace_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$line" in
+          *'"id":1'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/resume"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"old-thread"}}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"new-thread"}}}'
+            ;;
+          *'"method":"turn/start"'*)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"failed-turn"}}}'
+            printf '%s\\n' '{"method":"turn/failed","params":{"reason":"tool_error"}}'
+            exit 0
+            ;;
+          *)
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        prompt: "Base issue prompt for {{ issue.identifier }}"
+      )
+
+      issue = %Issue{
+        id: "issue-linear-agent-no-fallback",
+        identifier: "MT-258",
+        title: "Do not retry failed turn",
+        description: "No fresh thread on semantic failure",
+        state: "Human Review",
+        url: "https://example.org/issues/MT-258",
+        labels: []
+      }
+
+      assert_raise RuntimeError, ~r/:turn_failed/, fn ->
+        AgentRunner.run(
+          issue,
+          nil,
+          linear_agent: true,
+          existing_thread_id: "old-thread",
+          agent_session_id: "agent-session-258"
+        )
+      end
+
+      trace = File.read!(trace_file)
+      assert trace =~ "\"method\":\"thread/resume\""
+      assert trace =~ "\"threadId\":\"old-thread\""
+      refute trace =~ "\"method\":\"thread/start\""
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
   test "agent runner surfaces ssh startup failures instead of silently hopping hosts" do
     test_root =
       Path.join(
@@ -2576,4 +3281,16 @@ defmodule SymphonyElixir.CoreTest do
       File.rm_rf(test_root)
     end
   end
+
+  defp eventually(fun, attempts \\ 20)
+
+  defp eventually(fun, attempts) when attempts > 1 do
+    fun.()
+  rescue
+    ExUnit.AssertionError ->
+      Process.sleep(100)
+      eventually(fun, attempts - 1)
+  end
+
+  defp eventually(fun, 1), do: fun.()
 end
