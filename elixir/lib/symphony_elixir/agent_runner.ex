@@ -220,7 +220,9 @@ defmodule SymphonyElixir.AgentRunner do
     Linear Agent mode:
 
     - You are a native Linear Agent coworker. Communicate through Agent Activities using the `linear_agent_activity` tool, not the old Symphony Status comment.
+    - For direct answers and final handoffs, call `linear_agent_activity` with content `%{"type" => "response", "body" => "..."}`. For progress use `thought`; for clarifying questions use `elicitation`; for blockers use `error`. Do not use a custom `update` type.
     - Use `linear_agent_update_session` to keep Agent Plans sparse and useful for multi-step work, and to add PR/dashboard external URLs.
+    - Use `linear_update_issue_state` for state handoffs. For a direct non-code answer, emit the response activity and move the issue to `Human Review` before ending the turn. For blocked work, emit an elicitation or error and move the issue to `Blocked`.
     - Keep one long-lived issue conversation. Finish this turn when the current prompt is handled; Symphony will wake you on the next AgentSession prompt.
     - If repository context is unclear, ask a concise clarification using an elicitation activity and move or leave the issue in Blocked.
     - Resolve repository context agentically: inspect configured local repo roots, `gh`, GitHub, and web context. Clone independent copies into the issue workspace only when the target repo is unambiguous.

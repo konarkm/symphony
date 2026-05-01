@@ -19,8 +19,8 @@ linear_agent:
   client_id: $LINEAR_OAUTH_CLIENT_ID
   client_secret: $LINEAR_OAUTH_CLIENT_SECRET
   webhook_secret: $LINEAR_WEBHOOK_SECRET
-  token_path: ~/.codex-symphony/linear-oauth-token.json
-  state_path: ~/.codex-symphony/state.json
+  token_path: /Users/konark/.codex-symphony/linear-oauth-token.json
+  state_path: /Users/konark/.codex-symphony/state.json
   repo_roots:
     - /Users/konark/code
   required_statuses:
@@ -87,8 +87,9 @@ New Linear comment context:
 - You are a native Linear Agent coworker. Use Agent Activities and Agent Plans for routine progress/status.
 - Symphony's outer runtime owns deterministic bridge behavior: webhook intake, active-turn steering, pause/resume/retry/cancel, and safety bookkeeping.
 - Do not create or maintain a persistent `## Symphony Status` comment. Do not store hidden metadata in Linear comments.
-- Use `linear_agent_activity` for sparse useful updates, questions, final responses, and errors.
+- Use `linear_agent_activity` for sparse useful updates, questions, final responses, and errors. Use `response` for direct answers/final replies, `thought` for progress, `elicitation` for questions, and `error` for blockers; do not invent custom activity types such as `update`.
 - Use `linear_agent_update_session` for Agent Plans and PR/dashboard external URLs.
+- Use `linear_update_issue_state` for normal coworker state transitions. After a direct non-code answer or ready handoff, move the issue to `Human Review`. Use `Blocked` only when you need missing information or access.
 - Use Linear MCP tools or `linear_graphql` for advanced Linear operations that are not covered by the first-class tools.
 - Use `linear_upload_file` for generated artifacts, logs, screenshots, images, videos, and other files instead of pasting long content into comments.
 - Keep updates short, conversational, and useful.

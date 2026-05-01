@@ -748,6 +748,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_linear_agent_session_event(%State{} = state, %{issue: %Issue{} = issue} = event) do
+    issue = refresh_linear_agent_issue(issue)
+    event = Map.put(event, :issue, issue)
+
     case Map.get(event, :action) do
       action when action in ["created", "prompted"] ->
         agent_session_id = Map.get(event, :agent_session_id)
@@ -788,6 +791,23 @@ defmodule SymphonyElixir.Orchestrator do
     Logger.warning("Ignoring Linear AgentSession event without issue: #{inspect(Map.take(event, [:action, :agent_session_id]))}")
     state
   end
+
+  defp refresh_linear_agent_issue(%Issue{id: issue_id} = issue) when is_binary(issue_id) and issue_id != "" do
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
+      {:ok, [%Issue{} = refreshed | _]} ->
+        refreshed
+
+      {:ok, []} ->
+        Logger.warning("Linear AgentSession issue refresh returned no issue for #{issue_context(issue)}; using webhook payload")
+        issue
+
+      {:error, reason} ->
+        Logger.warning("Linear AgentSession issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}; using webhook payload")
+        issue
+    end
+  end
+
+  defp refresh_linear_agent_issue(%Issue{} = issue), do: issue
 
   defp acknowledge_agent_session(nil, _action), do: :ok
 

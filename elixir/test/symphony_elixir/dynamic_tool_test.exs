@@ -23,6 +23,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert Enum.find(specs, &(&1["name"] == "linear_download_file"))
     assert Enum.find(specs, &(&1["name"] == "linear_agent_activity"))
     assert Enum.find(specs, &(&1["name"] == "linear_agent_update_session"))
+    assert Enum.find(specs, &(&1["name"] == "linear_update_issue_state"))
     assert Enum.find(specs, &(&1["name"] == "symphony_repo_inventory"))
 
     assert description =~ "Linear"
@@ -42,6 +43,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                  "linear_download_file",
                  "linear_agent_activity",
                  "linear_agent_update_session",
+                 "linear_update_issue_state",
                  "symphony_repo_inventory"
                ]
              }
@@ -319,6 +321,44 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert response["success"] == true
     assert response["output"] == ":ok"
+  end
+
+  test "linear_update_issue_state updates the active issue by state name" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    issue = %Issue{id: "issue-1", identifier: "KM-1"}
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    response =
+      DynamicTool.execute(
+        "linear_update_issue_state",
+        %{"state" => "Human Review"},
+        issue: issue
+      )
+
+    assert response["success"] == true
+    assert_receive {:memory_tracker_state_update, "issue-1", "Human Review"}
+    assert Jason.decode!(response["output"]) == %{"ok" => true, "issueId" => "issue-1", "state" => "Human Review"}
+  end
+
+  test "linear_update_issue_state validates required state and issue context" do
+    missing_state =
+      DynamicTool.execute(
+        "linear_update_issue_state",
+        %{},
+        issue: %Issue{id: "issue-1"}
+      )
+
+    assert missing_state["success"] == false
+    assert Jason.decode!(missing_state["output"])["error"]["message"] == "Missing required argument `state`."
+
+    missing_issue =
+      DynamicTool.execute(
+        "linear_update_issue_state",
+        %{"state" => "Human Review"}
+      )
+
+    assert missing_issue["success"] == false
+    assert Jason.decode!(missing_issue["output"])["error"]["message"] =~ "requires `issueId`"
   end
 
   test "linear_upload_file validates workspace paths before calling Linear" do

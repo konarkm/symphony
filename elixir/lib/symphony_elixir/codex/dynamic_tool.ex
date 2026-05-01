@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Executes client-side tool calls requested by Codex app-server turns.
   """
 
-  alias SymphonyElixir.{Config, PathSafety, RepoResolver}
+  alias SymphonyElixir.{Config, PathSafety, RepoResolver, Tracker}
   alias SymphonyElixir.Linear.{Agent, Client}
 
   @linear_graphql_tool "linear_graphql"
@@ -11,6 +11,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   @linear_download_file_tool "linear_download_file"
   @linear_agent_activity_tool "linear_agent_activity"
   @linear_agent_update_session_tool "linear_agent_update_session"
+  @linear_update_issue_state_tool "linear_update_issue_state"
   @symphony_repo_inventory_tool "symphony_repo_inventory"
   @max_upload_bytes 50 * 1_024 * 1_024
   @max_download_bytes 50 * 1_024 * 1_024
@@ -71,6 +72,13 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   @linear_agent_activity_description """
   Emit a native Linear Agent Activity in the current AgentSession. Use this for sparse coworker updates,
   elicitation, final responses, meaningful actions, and errors.
+
+  Content must use Linear Agent Activity types:
+  - `response` with `body` for direct answers and final responses.
+  - `thought` with `body` for sparse progress updates.
+  - `elicitation` with `body` for clarifying questions.
+  - `error` with `body` for blockers/failures.
+  - `action` with `action`, `parameter`, and optional `result` for tool-like activity.
   """
   @linear_agent_activity_input_schema %{
     "type" => "object",
@@ -78,7 +86,22 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     "required" => ["content"],
     "properties" => %{
       "agentSessionId" => %{"type" => ["string", "null"], "description" => "Linear AgentSession id. Defaults to current session."},
-      "content" => %{"type" => "object", "additionalProperties" => true}
+      "content" => %{
+        "type" => "object",
+        "additionalProperties" => true,
+        "required" => ["type"],
+        "properties" => %{
+          "type" => %{
+            "type" => "string",
+            "enum" => ["thought", "response", "elicitation", "error", "action"],
+            "description" => "Use response for direct answers/final replies, thought for progress, elicitation for questions, error for blockers, and action for tool-like actions."
+          },
+          "body" => %{"type" => "string", "description" => "Required for thought, response, elicitation, and error."},
+          "action" => %{"type" => "string", "description" => "Required for action activities."},
+          "parameter" => %{"type" => "string", "description" => "Required for action activities."},
+          "result" => %{"type" => ["string", "null"], "description" => "Optional result for action activities."}
+        }
+      }
     }
   }
   @linear_agent_update_session_description """
@@ -91,6 +114,20 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     "properties" => %{
       "agentSessionId" => %{"type" => ["string", "null"], "description" => "Linear AgentSession id. Defaults to current session."},
       "input" => %{"type" => "object", "additionalProperties" => true}
+    }
+  }
+  @linear_update_issue_state_description """
+  Move the active Linear issue to a named workflow state. Use this for semantic coworker state
+  transitions such as Blocked, Human Review, Rework, Done, and Canceled. Merging still only
+  happens when the issue is already in the Merging state.
+  """
+  @linear_update_issue_state_input_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["state"],
+    "properties" => %{
+      "issueId" => %{"type" => ["string", "null"], "description" => "Linear issue id. Defaults to the active issue."},
+      "state" => %{"type" => "string", "description" => "Target Linear workflow state name, for example Human Review or Blocked."}
     }
   }
   @symphony_repo_inventory_description """
@@ -122,6 +159,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
       @linear_agent_update_session_tool ->
         execute_linear_agent_update_session(arguments, opts)
+
+      @linear_update_issue_state_tool ->
+        execute_linear_update_issue_state(arguments, opts)
 
       @symphony_repo_inventory_tool ->
         execute_symphony_repo_inventory(arguments)
@@ -163,6 +203,11 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "name" => @linear_agent_update_session_tool,
         "description" => @linear_agent_update_session_description,
         "inputSchema" => @linear_agent_update_session_input_schema
+      },
+      %{
+        "name" => @linear_update_issue_state_tool,
+        "description" => @linear_update_issue_state_description,
+        "inputSchema" => @linear_update_issue_state_input_schema
       },
       %{
         "name" => @symphony_repo_inventory_tool,
@@ -265,6 +310,19 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
+  defp execute_linear_update_issue_state(arguments, opts) do
+    with {:ok, input} <- normalize_map_arguments(arguments, @linear_update_issue_state_tool),
+         {:ok, issue_id} <- issue_id_for_tool(input, opts),
+         {:ok, state_name} <- normalize_required_string(input, "state") do
+      case Tracker.update_issue_state(issue_id, state_name) do
+        :ok -> dynamic_tool_response(true, encode_payload(%{"ok" => true, "issueId" => issue_id, "state" => state_name}))
+        {:error, reason} -> failure_response(tool_error_payload(reason))
+      end
+    else
+      {:error, reason} -> failure_response(tool_error_payload(reason))
+    end
+  end
+
   defp execute_symphony_repo_inventory(arguments) do
     query =
       case arguments do
@@ -291,6 +349,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       value when is_binary(value) and value != "" -> {:ok, value}
       _ -> {:error, :missing_agent_session_id}
     end
+  end
+
+  defp normalize_content_map(%{"content" => %{"type" => "update"} = content}) do
+    {:ok, Map.put(content, "type", "response")}
   end
 
   defp normalize_content_map(%{"content" => content}) when is_map(content), do: {:ok, content}
@@ -416,6 +478,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp validate_upload_size(size), do: {:error, {:invalid_file_size, size}}
 
   defp issue_id_for_upload(input, opts) do
+    issue_id_for_tool(input, opts, :missing_issue_id)
+  end
+
+  defp issue_id_for_tool(input, opts, missing_reason \\ :missing_active_issue_id) do
     case Map.get(input, "issueId") do
       issue_id when is_binary(issue_id) and issue_id != "" ->
         {:ok, issue_id}
@@ -423,7 +489,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       _ ->
         case Keyword.get(opts, :issue) do
           %{id: issue_id} when is_binary(issue_id) and issue_id != "" -> {:ok, issue_id}
-          _ -> {:error, :missing_issue_id}
+          _ -> {:error, missing_reason}
         end
     end
   end
@@ -749,6 +815,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     %{
       "error" => %{
         "message" => "`linear_upload_file` requires `issueId` when there is no active issue context."
+      }
+    }
+  end
+
+  defp tool_error_payload(:missing_active_issue_id) do
+    %{
+      "error" => %{
+        "message" => "`linear_update_issue_state` requires `issueId` when there is no active issue context."
       }
     }
   end
