@@ -44,7 +44,7 @@ agent:
   max_concurrent_agents: 10
   max_turns: 20
 codex:
-  command: CODEX_HOME=/Users/konark/.codex-symphony codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=medium app-server
+  command: CODEX_HOME=/Users/konark/.codex codex --config shell_environment_policy.inherit=all app-server
   approval_policy: never
   thread_sandbox: danger-full-access
   turn_sandbox_policy:
