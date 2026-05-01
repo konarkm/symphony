@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Linear.Client do
 
   require Logger
   alias SymphonyElixir.{Config, Linear.Issue}
+  alias SymphonyElixir.Linear.OAuth
 
   @issue_page_size 50
   @max_error_body_log_bytes 1_000
@@ -381,16 +382,27 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp graphql_headers do
-    case Config.settings!().tracker.api_key do
-      nil ->
-        {:error, :missing_linear_api_token}
+    settings = Config.settings!()
 
-      token ->
+    cond do
+      settings.linear_agent.enabled ->
+        with {:ok, token} <- OAuth.access_token() do
+          {:ok,
+           [
+             {"Authorization", token},
+             {"Content-Type", "application/json"}
+           ]}
+        end
+
+      is_binary(settings.tracker.api_key) ->
         {:ok,
          [
-           {"Authorization", token},
+           {"Authorization", settings.tracker.api_key},
            {"Content-Type", "application/json"}
          ]}
+
+      true ->
+        {:error, :missing_linear_api_token}
     end
   end
 

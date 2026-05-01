@@ -3,12 +3,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Executes client-side tool calls requested by Codex app-server turns.
   """
 
-  alias SymphonyElixir.{Config, PathSafety}
-  alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.{Config, PathSafety, RepoResolver}
+  alias SymphonyElixir.Linear.{Agent, Client}
 
   @linear_graphql_tool "linear_graphql"
   @linear_upload_file_tool "linear_upload_file"
   @linear_download_file_tool "linear_download_file"
+  @linear_agent_activity_tool "linear_agent_activity"
+  @linear_agent_update_session_tool "linear_agent_update_session"
+  @symphony_repo_inventory_tool "symphony_repo_inventory"
   @max_upload_bytes 50 * 1_024 * 1_024
   @max_download_bytes 50 * 1_024 * 1_024
   @linear_graphql_description """
@@ -65,6 +68,42 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       "allowOutsideWorkspace" => %{"type" => "boolean", "description" => "Allow destination paths outside the issue workspace. Defaults to false."}
     }
   }
+  @linear_agent_activity_description """
+  Emit a native Linear Agent Activity in the current AgentSession. Use this for sparse coworker updates,
+  elicitation, final responses, meaningful actions, and errors.
+  """
+  @linear_agent_activity_input_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["content"],
+    "properties" => %{
+      "agentSessionId" => %{"type" => ["string", "null"], "description" => "Linear AgentSession id. Defaults to current session."},
+      "content" => %{"type" => "object", "additionalProperties" => true}
+    }
+  }
+  @linear_agent_update_session_description """
+  Update native Linear AgentSession metadata such as plan and externalUrls. Plan updates replace the full plan.
+  """
+  @linear_agent_update_session_input_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["input"],
+    "properties" => %{
+      "agentSessionId" => %{"type" => ["string", "null"], "description" => "Linear AgentSession id. Defaults to current session."},
+      "input" => %{"type" => "object", "additionalProperties" => true}
+    }
+  }
+  @symphony_repo_inventory_description """
+  List repositories under Symphony's explicitly configured local repo roots. Use this before deciding
+  which repo to clone or asking the user for clarification.
+  """
+  @symphony_repo_inventory_input_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "properties" => %{
+      "query" => %{"type" => ["string", "null"], "description" => "Optional repo name/path/remote search text."}
+    }
+  }
 
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
@@ -77,6 +116,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
       @linear_download_file_tool ->
         execute_linear_download_file(arguments, opts)
+
+      @linear_agent_activity_tool ->
+        execute_linear_agent_activity(arguments, opts)
+
+      @linear_agent_update_session_tool ->
+        execute_linear_agent_update_session(arguments, opts)
+
+      @symphony_repo_inventory_tool ->
+        execute_symphony_repo_inventory(arguments)
 
       other ->
         failure_response(%{
@@ -105,6 +153,21 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "name" => @linear_download_file_tool,
         "description" => @linear_download_file_description,
         "inputSchema" => @linear_download_file_input_schema
+      },
+      %{
+        "name" => @linear_agent_activity_tool,
+        "description" => @linear_agent_activity_description,
+        "inputSchema" => @linear_agent_activity_input_schema
+      },
+      %{
+        "name" => @linear_agent_update_session_tool,
+        "description" => @linear_agent_update_session_description,
+        "inputSchema" => @linear_agent_update_session_input_schema
+      },
+      %{
+        "name" => @symphony_repo_inventory_tool,
+        "description" => @symphony_repo_inventory_description,
+        "inputSchema" => @symphony_repo_inventory_input_schema
       }
     ]
   end
@@ -175,6 +238,66 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         failure_response(tool_error_payload(reason))
     end
   end
+
+  defp execute_linear_agent_activity(arguments, opts) do
+    with {:ok, input} <- normalize_map_arguments(arguments, @linear_agent_activity_tool),
+         {:ok, agent_session_id} <- agent_session_id(input, opts),
+         {:ok, content} <- normalize_content_map(input) do
+      case Agent.create_activity(agent_session_id, content) do
+        :ok -> dynamic_tool_response(true, encode_payload(%{"ok" => true}))
+        {:error, reason} -> failure_response(tool_error_payload(reason))
+      end
+    else
+      {:error, reason} -> failure_response(tool_error_payload(reason))
+    end
+  end
+
+  defp execute_linear_agent_update_session(arguments, opts) do
+    with {:ok, input} <- normalize_map_arguments(arguments, @linear_agent_update_session_tool),
+         {:ok, agent_session_id} <- agent_session_id(input, opts),
+         {:ok, session_input} <- normalize_session_input(input) do
+      case Agent.update_session(agent_session_id, session_input) do
+        :ok -> dynamic_tool_response(true, encode_payload(%{"ok" => true}))
+        {:error, reason} -> failure_response(tool_error_payload(reason))
+      end
+    else
+      {:error, reason} -> failure_response(tool_error_payload(reason))
+    end
+  end
+
+  defp execute_symphony_repo_inventory(arguments) do
+    query =
+      case arguments do
+        %{"query" => query} when is_binary(query) -> String.trim(query)
+        _ -> ""
+      end
+
+    repos =
+      if query == "" do
+        RepoResolver.local_repositories()
+      else
+        case RepoResolver.find_local(query) do
+          {:ok, repo} -> [repo]
+          {:ambiguous, repos} -> repos
+          :not_found -> []
+        end
+      end
+
+    dynamic_tool_response(true, encode_payload(%{"roots" => RepoResolver.configured_roots(), "repositories" => repos}))
+  end
+
+  defp agent_session_id(input, opts) do
+    case Map.get(input, "agentSessionId") || Keyword.get(opts, :agent_session_id) do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _ -> {:error, :missing_agent_session_id}
+    end
+  end
+
+  defp normalize_content_map(%{"content" => content}) when is_map(content), do: {:ok, content}
+  defp normalize_content_map(_input), do: {:error, :missing_agent_activity_content}
+
+  defp normalize_session_input(%{"input" => input}) when is_map(input), do: {:ok, input}
+  defp normalize_session_input(_input), do: {:error, :missing_agent_session_input}
 
   @file_upload_mutation """
   mutation SymphonyFileUpload($contentType: String!, $filename: String!, $size: Int!) {

@@ -5,8 +5,8 @@ tracker:
   active_states:
     - Todo
     - In Progress
+    - Blocked
     - Human Review
-    - Rework
     - Merging
   terminal_states:
     - Closed
@@ -14,27 +14,41 @@ tracker:
     - Canceled
     - Duplicate
     - Done
+linear_agent:
+  enabled: true
+  client_id: $LINEAR_OAUTH_CLIENT_ID
+  client_secret: $LINEAR_OAUTH_CLIENT_SECRET
+  webhook_secret: $LINEAR_WEBHOOK_SECRET
+  token_path: ~/.codex-symphony/linear-oauth-token.json
+  state_path: ~/.codex-symphony/state.json
+  repo_roots:
+    - /Users/konark/code
+  required_statuses:
+    - Todo
+    - In Progress
+    - Blocked
+    - Human Review
+    - Merging
+    - Done
+    - Canceled
 polling:
   interval_ms: 5000
 workspace:
   root: ~/code/symphony-workspaces
 hooks:
   after_create: |
-    git clone --depth 1 https://github.com/konarkm/symphony .
-    if command -v mise >/dev/null 2>&1; then
-      cd elixir && mise trust && mise exec -- mix deps.get
-    fi
+    printf 'Symphony issue workspace initialized at %s\n' "$(pwd)" > README.md
   before_remove: |
-    cd elixir && mise exec -- mix workspace.before_remove
+    true
 agent:
   max_concurrent_agents: 10
   max_turns: 20
 codex:
-  command: CODEX_HOME=/Users/konark/.codex-symphony codex --disable apps --disable plugins --config 'mcp_servers={}' --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=medium app-server
+  command: CODEX_HOME=/Users/konark/.codex-symphony codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=medium app-server
   approval_policy: never
-  thread_sandbox: workspace-write
+  thread_sandbox: danger-full-access
   turn_sandbox_policy:
-    type: workspaceWrite
+    type: dangerFullAccess
     networkAccess: true
 ---
 
@@ -70,52 +84,43 @@ New Linear comment context:
 ## Operating Style
 
 - Treat Linear as the primary control surface.
-- Symphony's outer runtime owns routine Linear bookkeeping: issue pickup, `Todo` -> `In Progress`, compact status comments, comment-consumption markers, and eyes reactions.
-- Do not use Linear MCP tools or `linear_graphql` for routine state/status/comment handling. Use them only when the ticket explicitly needs extra Linear data or advanced operations.
+- You are a native Linear Agent coworker. Use Agent Activities and Agent Plans for routine progress/status.
+- Symphony's outer runtime owns deterministic bridge behavior: webhook intake, active-turn steering, pause/resume/retry/cancel, and safety bookkeeping.
+- Do not create or maintain a persistent `## Symphony Status` comment. Do not store hidden metadata in Linear comments.
+- Use `linear_agent_activity` for sparse useful updates, questions, final responses, and errors.
+- Use `linear_agent_update_session` for Agent Plans and PR/dashboard external URLs.
+- Use Linear MCP tools or `linear_graphql` for advanced Linear operations that are not covered by the first-class tools.
 - Use `linear_upload_file` for generated artifacts, logs, screenshots, images, videos, and other files instead of pasting long content into comments.
 - Keep updates short, conversational, and useful.
 - Avoid long Definition-of-Done dumps unless the ticket explicitly asks for one.
-- Work only in the provided repository copy.
+- Start in the provided issue scratch workspace. Only clone or attach repositories when the intended repo is definitive and unambiguous.
 - Do not ask humans to perform follow-up actions unless blocked by missing required auth, permissions, tools, or product decisions.
-
-## Status Comment
-
-Maintain one persistent Linear comment headed exactly:
-
-`## Symphony Status`
-
-Keep it compact with these fields:
-
-- Status
-- Plan
-- Blockers
-- Validation
-- Last update
-
-The Symphony runtime stores comment-consumption metadata in the same comment with this hidden marker:
-
-`<!-- symphony:comments {"last_seen_comment_id":"...","last_seen_comment_updated_at":"...","paused":false} -->`
-
-Do not remove the marker. Do not create separate status dump comments.
 
 ## Comment Behavior
 
-- Treat all non-bot human Linear comments as actionable context.
-- The runtime acknowledges consumed comments with an eyes reaction.
+- Treat AgentSession prompts, issue comments, and PR comments as actionable context when they wake you.
 - Reply with text only when useful: a meaningful change, blocker, direct answer, or requested clarification.
-- Prefer replying in the specific Linear comment thread using `commentCreate` with `parentId` instead of posting a separate top-level reply.
-- No-op comments are allowed: if a comment does not require code or a text reply, mark it seen through the normal status flow and continue.
+- Prefer native Agent Activities for Linear-session conversation. Use issue/PR comments when they are the natural thread surface.
+- No-op turns are allowed: acknowledge only if useful and then idle.
 
 ## State Routing
 
-- `Todo`: the runtime will move the issue to `In Progress`; begin work.
-- `In Progress`: implement, validate, and keep the compact status comment current.
-- `Human Review`: wait and watch comments. If new comments are conversational or questions, reply in-thread and leave the issue in `Human Review`. If comments request work, move the issue to `Rework`, do the work, validate, and return to `Human Review`.
-- `Rework`: re-read the issue and new comments, update the plan, implement requested changes, validate, and return to `Human Review`.
+- `Todo`: if delegated to Symphony, move to `In Progress` before active work.
+- `In Progress`: work on the current prompt, update Agent Plan when useful, and comment/activity sparsely.
+- `Blocked`: use when repo context, credentials, permissions, or decisions are missing. Ask a concise elicitation.
+- `Human Review`: use when the answer/work/PR is ready for human review. New prompts or moving back to `In Progress` should resume work in the same issue room.
 - `Merging`: open and follow `.codex/skills/land/SKILL.md`; use the existing `land` flow, then move the issue to `Done`.
-- `Done`: terminal; do nothing.
+- `Done`/`Canceled`: terminal; do nothing.
 
 Natural approval comments do not trigger merging in this MVP. The issue must be moved to `Merging` before landing.
+
+## Repo Context
+
+- Use `symphony_repo_inventory` first to inspect configured local repo roots.
+- If local context is insufficient, use `gh` and broader GitHub/web search.
+- Clone independent repo copies under the issue workspace. Do not mutate existing local checkouts unless the human explicitly asks.
+- If multiple repos plausibly match, ask via an elicitation activity and move/leave the issue in `Blocked`.
+- Multiple repositories are allowed when clearly required.
 
 ## Skills
 
@@ -126,4 +131,4 @@ Natural approval comments do not trigger merging in this MVP. The issue must be 
 
 ## Completion
 
-Before moving to `Human Review`, make sure requested validation has run and the compact status comment has a concise handoff. For normal code changes, publish the PR or branch first. For tickets that explicitly say local-only, no-PR, or smoke-test-only, do not publish; hand off the local workspace path instead. If blocked, leave a short blocker note in the status comment with the exact missing thing and why it blocks progress.
+Before moving to `Human Review`, make sure requested validation has run and publish the PR/branch when the task is code work. Add PR URLs to the AgentSession external URLs. For non-code answers, respond clearly and leave the issue in `Human Review`. If blocked, use an elicitation or error activity with the exact missing thing.

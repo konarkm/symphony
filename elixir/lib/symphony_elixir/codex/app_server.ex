@@ -45,7 +45,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
+           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies, Keyword.get(opts, :thread_id)) do
         {:ok,
          %{
            port: port,
@@ -86,7 +86,12 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments, workspace: workspace, issue: issue, worker_host: worker_host)
+        DynamicTool.execute(tool, arguments,
+          workspace: workspace,
+          issue: issue,
+          worker_host: worker_host,
+          agent_session_id: Keyword.get(opts, :agent_session_id)
+        )
       end)
 
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
@@ -271,10 +276,38 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies) do
+  defp do_start_session(port, workspace, session_policies, thread_id) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies)
+      :ok -> start_or_resume_thread(port, workspace, session_policies, thread_id)
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp start_or_resume_thread(port, workspace, session_policies, thread_id)
+       when is_binary(thread_id) and thread_id != "" do
+    resume_thread(port, thread_id, workspace, session_policies)
+  end
+
+  defp start_or_resume_thread(port, workspace, session_policies, _thread_id) do
+    start_thread(port, workspace, session_policies)
+  end
+
+  defp resume_thread(port, thread_id, _workspace, _session_policies) do
+    request_id = @thread_start_id
+
+    send_message(port, %{
+      "method" => "thread/resume",
+      "id" => request_id,
+      "params" => %{
+        "threadId" => thread_id,
+        "persistExtendedHistory" => true
+      }
+    })
+
+    case await_response(port, request_id) do
+      {:ok, %{"thread" => %{"id" => resumed_thread_id}}} -> {:ok, resumed_thread_id}
+      {:ok, _payload} -> {:ok, thread_id}
+      other -> other
     end
   end
 

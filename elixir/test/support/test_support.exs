@@ -100,6 +100,14 @@ defmodule SymphonyElixir.TestSupport do
           tracker_assignee: nil,
           tracker_active_states: ["Todo", "In Progress"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+          linear_agent_enabled: false,
+          linear_agent_client_id: nil,
+          linear_agent_client_secret: nil,
+          linear_agent_webhook_secret: nil,
+          linear_agent_token_path: nil,
+          linear_agent_state_path: nil,
+          linear_agent_repo_roots: ["/Users/konark/code"],
+          linear_agent_required_statuses: ["Todo", "In Progress", "Blocked", "Human Review", "Merging", "Done", "Canceled"],
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           worker_ssh_hosts: [],
@@ -137,6 +145,14 @@ defmodule SymphonyElixir.TestSupport do
     tracker_assignee = Keyword.get(config, :tracker_assignee)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
+    linear_agent_enabled = Keyword.get(config, :linear_agent_enabled)
+    linear_agent_client_id = Keyword.get(config, :linear_agent_client_id)
+    linear_agent_client_secret = Keyword.get(config, :linear_agent_client_secret)
+    linear_agent_webhook_secret = Keyword.get(config, :linear_agent_webhook_secret)
+    linear_agent_token_path = Keyword.get(config, :linear_agent_token_path)
+    linear_agent_state_path = Keyword.get(config, :linear_agent_state_path)
+    linear_agent_repo_roots = Keyword.get(config, :linear_agent_repo_roots)
+    linear_agent_required_statuses = Keyword.get(config, :linear_agent_required_statuses)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
@@ -175,6 +191,15 @@ defmodule SymphonyElixir.TestSupport do
         "  assignee: #{yaml_value(tracker_assignee)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
+        "linear_agent:",
+        "  enabled: #{yaml_value(linear_agent_enabled)}",
+        "  client_id: #{yaml_value(linear_agent_client_id)}",
+        "  client_secret: #{yaml_value(linear_agent_client_secret)}",
+        "  webhook_secret: #{yaml_value(linear_agent_webhook_secret)}",
+        "  token_path: #{yaml_value(linear_agent_token_path)}",
+        "  state_path: #{yaml_value(linear_agent_state_path)}",
+        "  repo_roots: #{yaml_value(linear_agent_repo_roots)}",
+        "  required_statuses: #{yaml_value(linear_agent_required_statuses)}",
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",

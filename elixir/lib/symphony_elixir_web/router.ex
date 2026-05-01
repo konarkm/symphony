@@ -28,6 +28,8 @@ defmodule SymphonyElixirWeb.Router do
   end
 
   scope "/", SymphonyElixirWeb do
+    post("/webhooks/linear-agent", LinearAgentWebhookController, :receive)
+    get("/oauth/linear/callback", LinearOAuthController, :callback)
     get("/api/v1/state", ObservabilityApiController, :state)
 
     match(:*, "/", ObservabilityApiController, :method_not_allowed)

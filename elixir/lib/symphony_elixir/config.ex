@@ -122,10 +122,36 @@ defmodule SymphonyElixir.Config do
       settings.tracker.kind not in ["linear", "memory"] ->
         {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
 
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
+      settings.tracker.kind == "linear" ->
+        validate_linear_settings(settings)
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_linear_settings(%{linear_agent: %{enabled: true}} = settings) do
+    cond do
+      not is_binary(settings.linear_agent.client_id) ->
+        {:error, :missing_linear_oauth_client_id}
+
+      not is_binary(settings.linear_agent.client_secret) ->
+        {:error, :missing_linear_oauth_client_secret}
+
+      not File.exists?(settings.linear_agent.token_path) ->
+        {:error, {:missing_linear_oauth_token, settings.linear_agent.token_path}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_linear_settings(settings) do
+    cond do
+      not is_binary(settings.tracker.api_key) ->
         {:error, :missing_linear_api_token}
 
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
+      not is_binary(settings.tracker.project_slug) ->
         {:error, :missing_linear_project_slug}
 
       true ->

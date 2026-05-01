@@ -21,6 +21,9 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert Enum.find(specs, &(&1["name"] == "linear_upload_file"))
     assert Enum.find(specs, &(&1["name"] == "linear_download_file"))
+    assert Enum.find(specs, &(&1["name"] == "linear_agent_activity"))
+    assert Enum.find(specs, &(&1["name"] == "linear_agent_update_session"))
+    assert Enum.find(specs, &(&1["name"] == "symphony_repo_inventory"))
 
     assert description =~ "Linear"
   end
@@ -33,7 +36,14 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => ~s(Unsupported dynamic tool: "not_a_real_tool".),
-               "supportedTools" => ["linear_graphql", "linear_upload_file", "linear_download_file"]
+               "supportedTools" => [
+                 "linear_graphql",
+                 "linear_upload_file",
+                 "linear_download_file",
+                 "linear_agent_activity",
+                 "linear_agent_update_session",
+                 "symphony_repo_inventory"
+               ]
              }
            }
 

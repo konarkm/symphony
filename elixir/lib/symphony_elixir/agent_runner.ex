@@ -85,12 +85,41 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    start_opts =
+      [worker_host: worker_host]
+      |> maybe_put_existing_thread_id(Keyword.get(opts, :existing_thread_id))
+
+    with {:ok, session} <- AppServer.start_session(workspace, start_opts) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        if Keyword.get(opts, :linear_agent) == true do
+          run_single_linear_agent_turn(session, workspace, issue, codex_update_recipient, opts)
+        else
+          do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        end
       after
         AppServer.stop_session(session)
       end
+    end
+  end
+
+  defp maybe_put_existing_thread_id(opts, thread_id) when is_binary(thread_id) and thread_id != "",
+    do: Keyword.put(opts, :thread_id, thread_id)
+
+  defp maybe_put_existing_thread_id(opts, _thread_id), do: opts
+
+  defp run_single_linear_agent_turn(session, workspace, issue, codex_update_recipient, opts) do
+    prompt = build_turn_prompt(issue, opts, 1, 1)
+
+    with {:ok, turn_session} <-
+           AppServer.run_turn(
+             session,
+             prompt,
+             issue,
+             on_message: codex_message_handler(codex_update_recipient, issue),
+             agent_session_id: Keyword.get(opts, :agent_session_id)
+           ) do
+      Logger.info("Completed Linear Agent turn for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace}")
+      :ok
     end
   end
 
@@ -148,10 +177,15 @@ defmodule SymphonyElixir.AgentRunner do
   defp build_turn_prompt(issue, opts, 1, _max_turns) do
     base_prompt = PromptBuilder.build_prompt(issue, opts)
 
-    if Keyword.get(opts, :review_comment_mode) == true do
-      base_prompt <> "\n\n" <> review_comment_prompt(issue, opts)
-    else
-      base_prompt
+    cond do
+      Keyword.get(opts, :linear_agent) == true ->
+        base_prompt <> "\n\n" <> linear_agent_prompt(opts)
+
+      Keyword.get(opts, :review_comment_mode) == true ->
+        base_prompt <> "\n\n" <> review_comment_prompt(issue, opts)
+
+      true ->
+        base_prompt
     end
   end
 
@@ -179,6 +213,34 @@ defmodule SymphonyElixir.AgentRunner do
           #{steering_context}
           """
     end
+  end
+
+  defp linear_agent_prompt(opts) do
+    """
+    Linear Agent mode:
+
+    - You are a native Linear Agent coworker. Communicate through Agent Activities using the `linear_agent_activity` tool, not the old Symphony Status comment.
+    - Use `linear_agent_update_session` to keep Agent Plans sparse and useful for multi-step work, and to add PR/dashboard external URLs.
+    - Keep one long-lived issue conversation. Finish this turn when the current prompt is handled; Symphony will wake you on the next AgentSession prompt.
+    - If repository context is unclear, ask a concise clarification using an elicitation activity and move or leave the issue in Blocked.
+    - Resolve repository context agentically: inspect configured local repo roots, `gh`, GitHub, and web context. Clone independent copies into the issue workspace only when the target repo is unambiguous.
+    - For PR feedback, read the full PR activity/comments/checks like a coworker, then reply on GitHub where appropriate and summarize in Linear.
+    - Merging remains gated by the Linear `Merging` state only.
+
+    Agent session id: #{Keyword.get(opts, :agent_session_id) || "unknown"}
+
+    #{prompt_context(opts)}
+    """
+    |> String.trim()
+  end
+
+  defp prompt_context(opts) do
+    [
+      Keyword.get(opts, :prompt_context) && "Linear promptContext:\n#{Keyword.get(opts, :prompt_context)}",
+      Keyword.get(opts, :prompt_body) && "User prompt:\n#{Keyword.get(opts, :prompt_body)}"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n\n")
   end
 
   defp review_comment_prompt(%Issue{} = issue, opts) do

@@ -65,6 +65,49 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule LinearAgent do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @default_required_statuses ["Todo", "In Progress", "Blocked", "Human Review", "Merging", "Done", "Canceled"]
+
+    @primary_key false
+    embedded_schema do
+      field(:enabled, :boolean, default: false)
+      field(:client_id, :string)
+      field(:client_secret, :string)
+      field(:redirect_uri, :string, default: "http://127.0.0.1:4000/oauth/linear/callback")
+      field(:token_path, :string)
+      field(:webhook_secret, :string)
+      field(:webhook_path, :string, default: "/webhooks/linear-agent")
+      field(:required_statuses, {:array, :string}, default: @default_required_statuses)
+      field(:repo_roots, {:array, :string}, default: ["/Users/konark/code"])
+      field(:state_path, :string)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :enabled,
+          :client_id,
+          :client_secret,
+          :redirect_uri,
+          :token_path,
+          :webhook_secret,
+          :webhook_path,
+          :required_statuses,
+          :repo_roots,
+          :state_path
+        ],
+        empty_values: []
+      )
+    end
+  end
+
   defmodule Polling do
     @moduledoc false
     use Ecto.Schema
@@ -264,6 +307,7 @@ defmodule SymphonyElixir.Config.Schema do
   embedded_schema do
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:linear_agent, LinearAgent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
@@ -356,6 +400,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast(attrs, [])
     |> cast_embed(:tracker, with: &Tracker.changeset/2)
     |> cast_embed(:polling, with: &Polling.changeset/2)
+    |> cast_embed(:linear_agent, with: &LinearAgent.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
@@ -377,13 +422,30 @@ defmodule SymphonyElixir.Config.Schema do
       | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
     }
 
+    linear_agent = %{
+      settings.linear_agent
+      | client_id: resolve_secret_setting(settings.linear_agent.client_id, System.get_env("LINEAR_OAUTH_CLIENT_ID")),
+        client_secret: resolve_secret_setting(settings.linear_agent.client_secret, System.get_env("LINEAR_OAUTH_CLIENT_SECRET")),
+        webhook_secret: resolve_secret_setting(settings.linear_agent.webhook_secret, System.get_env("LINEAR_WEBHOOK_SECRET")),
+        token_path:
+          resolve_path_value(
+            settings.linear_agent.token_path,
+            Path.join(workspace.root, ".symphony/linear_oauth_token.json")
+          ),
+        state_path: resolve_path_value(settings.linear_agent.state_path, Path.join(workspace.root, ".symphony/state.json")),
+        repo_roots:
+          settings.linear_agent.repo_roots
+          |> Enum.map(&resolve_path_value(&1, &1))
+          |> Enum.uniq()
+    }
+
     codex = %{
       settings.codex
       | approval_policy: normalize_keys(settings.codex.approval_policy),
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    %{settings | tracker: tracker, linear_agent: linear_agent, workspace: workspace, codex: codex}
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -421,6 +483,8 @@ defmodule SymphonyElixir.Config.Schema do
       resolved -> resolved
     end
   end
+
+  defp resolve_path_value(nil, default), do: default
 
   defp resolve_path_value(value, default) when is_binary(value) do
     case normalize_path_token(value) do

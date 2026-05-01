@@ -7,8 +7,8 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
-  alias SymphonyElixir.Linear.{BridgeCommand, CommentSteering, Issue}
+  alias SymphonyElixir.{AgentRunner, Config, StateStore, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.Linear.{Agent, BridgeCommand, CommentSteering, Issue}
 
   @continuation_retry_delay_ms 1_000
   @comment_poll_interval_ms 5_000
@@ -57,6 +57,11 @@ defmodule SymphonyElixir.Orchestrator do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
+  @spec handle_agent_session_event(map(), GenServer.server()) :: :ok
+  def handle_agent_session_event(event, server \\ __MODULE__) when is_map(event) do
+    GenServer.cast(server, {:linear_agent_session_event, event})
+  end
+
   @impl true
   def init(_opts) do
     now_ms = System.monotonic_time(:millisecond)
@@ -73,7 +78,7 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil
     }
 
-    run_terminal_workspace_cleanup()
+    maybe_run_terminal_workspace_cleanup(config)
 
     state =
       state
@@ -81,6 +86,12 @@ defmodule SymphonyElixir.Orchestrator do
       |> schedule_comment_poll(@comment_poll_interval_ms)
 
     {:ok, state}
+  end
+
+  @impl true
+  def handle_cast({:linear_agent_session_event, event}, state) when is_map(event) do
+    state = refresh_runtime_config(state)
+    {:noreply, handle_linear_agent_session_event(state, event)}
   end
 
   @impl true
@@ -208,6 +219,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       running_entry ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        maybe_store_linear_agent_thread(issue_id, updated_running_entry)
 
         state =
           state
@@ -240,6 +252,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
+    if Config.settings!().linear_agent.enabled do
+      reconcile_running_issues(state)
+    else
+      maybe_dispatch_polling(state)
+    end
+  end
+
+  defp maybe_dispatch_polling(%State{} = state) do
     state = reconcile_running_issues(state)
 
     with :ok <- Config.validate!(),
@@ -450,6 +470,7 @@ defmodule SymphonyElixir.Orchestrator do
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
         worker_host = Map.get(running_entry, :worker_host)
+        cleanup_workspace = cleanup_workspace and Map.get(running_entry, :mode) != :linear_agent
 
         if cleanup_workspace do
           cleanup_issue_workspace(identifier, worker_host)
@@ -726,6 +747,84 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp handle_linear_agent_session_event(%State{} = state, %{issue: %Issue{} = issue} = event) do
+    case Map.get(event, :action) do
+      action when action in ["created", "prompted"] ->
+        agent_session_id = Map.get(event, :agent_session_id)
+        prompt = linear_agent_prompt(event)
+
+        case Map.get(state.running, issue.id) do
+          %{pid: pid, active_turn_id: active_turn_id} when is_pid(pid) and is_binary(active_turn_id) ->
+            send(pid, {:symphony_steer, prompt})
+            state
+
+          _ ->
+            acknowledge_agent_session(agent_session_id, action)
+
+            issue_state = StateStore.get_issue(issue.id)
+
+            runner_opts =
+              [
+                mode: :linear_agent,
+                linear_agent: true,
+                agent_session_id: agent_session_id,
+                prompt_context: Map.get(event, :prompt_context),
+                prompt_body: Map.get(event, :prompt_body),
+                existing_thread_id: Map.get(issue_state, "thread_id")
+              ]
+
+            state
+            |> release_issue_claim(issue.id)
+            |> do_dispatch_issue(%{issue | assigned_to_worker: true}, nil, nil, runner_opts)
+        end
+
+      _ ->
+        Logger.debug("Ignoring Linear AgentSession action=#{inspect(Map.get(event, :action))}")
+        state
+    end
+  end
+
+  defp handle_linear_agent_session_event(state, event) do
+    Logger.warning("Ignoring Linear AgentSession event without issue: #{inspect(Map.take(event, [:action, :agent_session_id]))}")
+    state
+  end
+
+  defp acknowledge_agent_session(nil, _action), do: :ok
+
+  defp acknowledge_agent_session(agent_session_id, "created") when is_binary(agent_session_id) do
+    Agent.create_activity(agent_session_id, %{
+      "type" => "thought",
+      "body" => "I picked this up and am reading the issue context."
+    })
+  end
+
+  defp acknowledge_agent_session(agent_session_id, _action) when is_binary(agent_session_id) do
+    Agent.create_activity(agent_session_id, %{
+      "type" => "thought",
+      "body" => "I saw the new prompt and am checking what needs to change."
+    })
+  end
+
+  defp linear_agent_prompt(event) do
+    [
+      "Linear AgentSession event: #{Map.get(event, :action)}",
+      session_line(Map.get(event, :agent_session_id)),
+      prompt_context_block(Map.get(event, :prompt_context)),
+      prompt_body_block(Map.get(event, :prompt_body))
+    ]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join("\n\n")
+  end
+
+  defp session_line(nil), do: nil
+  defp session_line(agent_session_id), do: "Agent session id: #{agent_session_id}"
+
+  defp prompt_context_block(nil), do: nil
+  defp prompt_context_block(prompt_context), do: "Prompt context:\n#{prompt_context}"
+
+  defp prompt_body_block(nil), do: nil
+  defp prompt_body_block(prompt_body), do: "New prompt:\n#{prompt_body}"
+
   defp dispatch_review_comment_issue(%State{} = state, %Issue{} = issue, comments) when is_list(comments) do
     runner_opts = [
       review_comment_mode: true,
@@ -840,6 +939,7 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             mode: mode,
+            agent_session_id: Keyword.get(runner_opts, :agent_session_id),
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
           })
@@ -911,6 +1011,14 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp complete_normal_agent_run(%State{} = state, issue_id, %{mode: :linear_agent}, session_id) do
+    Logger.info("Linear Agent turn completed for issue_id=#{issue_id} session_id=#{session_id}; idling issue room")
+
+    state
+    |> complete_issue(issue_id)
+    |> release_issue_claim(issue_id)
+  end
+
   defp complete_normal_agent_run(%State{} = state, issue_id, running_entry, session_id) do
     Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
@@ -924,6 +1032,18 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_path: Map.get(running_entry, :workspace_path)
     })
   end
+
+  defp maybe_store_linear_agent_thread(issue_id, %{mode: :linear_agent, thread_id: thread_id} = running_entry)
+       when is_binary(issue_id) and is_binary(thread_id) do
+    StateStore.put_issue(issue_id, %{
+      thread_id: thread_id,
+      identifier: Map.get(running_entry, :identifier),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      updated_at: DateTime.to_iso8601(DateTime.utc_now())
+    })
+  end
+
+  defp maybe_store_linear_agent_thread(_issue_id, _running_entry), do: :ok
 
   defp complete_issue(%State{} = state, issue_id) do
     %{
@@ -1068,6 +1188,14 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
 
   defp poll_comment_steering(%State{} = state) do
+    if Config.settings!().linear_agent.enabled do
+      state
+    else
+      do_poll_comment_steering(state)
+    end
+  end
+
+  defp do_poll_comment_steering(%State{} = state) do
     started_at = DateTime.utc_now()
 
     try do
@@ -1507,7 +1635,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp append_list(existing, additions) when is_list(existing), do: existing ++ additions
   defp append_list(_existing, additions), do: additions
 
-  defp run_terminal_workspace_cleanup do
+  defp maybe_run_terminal_workspace_cleanup(%{linear_agent: %{enabled: true}}) do
+    Logger.info("Skipping terminal workspace cleanup in Linear Agent mode")
+    :ok
+  end
+
+  defp maybe_run_terminal_workspace_cleanup(_config) do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
         issues

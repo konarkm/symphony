@@ -107,10 +107,13 @@ defmodule SymphonyElixir.CoreTest do
 
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
-    assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/konarkm/symphony ."
-    assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
-    assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
-    assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"
+    assert Map.get(hooks, "after_create") =~ "Symphony issue workspace initialized"
+    assert Map.get(hooks, "before_remove") =~ "true"
+
+    linear_agent = Map.get(config, "linear_agent", %{})
+    assert Map.get(linear_agent, "enabled") == true
+    assert Map.get(linear_agent, "repo_roots") == ["/Users/konark/code"]
+    assert "Blocked" in Map.get(linear_agent, "required_statuses")
 
     assert String.trim(prompt) != ""
     assert is_binary(Config.workflow_prompt())
