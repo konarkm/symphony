@@ -1412,7 +1412,10 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Title: Use rich templates for WORKFLOW.md"
     assert prompt =~ "State: In Progress"
     assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
-    assert prompt =~ "## Symphony Status"
+    assert prompt =~ "Do not create or maintain a persistent `## Symphony Status` comment"
+    assert prompt =~ "## End-of-Turn Contract"
+    assert prompt =~ "The final assistant message is internal to Symphony logs/dashboard"
+    assert prompt =~ "Do not duplicate the user-facing Linear response in the final assistant message"
     assert prompt =~ "Natural approval comments do not trigger merging in this MVP"
     assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
     assert prompt =~ "do not call `gh pr merge` directly"
@@ -1606,6 +1609,105 @@ defmodule SymphonyElixir.CoreTest do
 
       assert session_id == "thread-live-turn-live"
     after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner adds Linear Agent end-of-turn contract" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-linear-agent-prompt-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-linear-agent"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-linear-agent-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        prompt: "Base issue prompt for {{ issue.identifier }}"
+      )
+
+      issue = %Issue{
+        id: "issue-linear-agent",
+        identifier: "MT-251",
+        title: "Answer in Linear",
+        description: "Simple question",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-251",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run(
+                 issue,
+                 nil,
+                 linear_agent: true,
+                 agent_session_id: "agent-session-251"
+               )
+
+      turn_text =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.find(&(&1["method"] == "turn/start"))
+        |> get_in(["params", "input"])
+        |> Enum.map_join("\n", &Map.get(&1, "text", ""))
+
+      assert turn_text =~ "Base issue prompt for MT-251"
+      assert turn_text =~ "Linear Agent mode:"
+      assert turn_text =~ "The final assistant message is internal to Symphony logs/dashboard"
+      assert turn_text =~ "not the Linear-facing response"
+      assert turn_text =~ "Do not duplicate the user-facing Linear response there"
+      assert turn_text =~ "Agent session id: agent-session-251"
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
     end
   end

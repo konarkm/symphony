@@ -224,6 +224,10 @@ defmodule SymphonyElixir.AgentRunner do
     - Use `linear_agent_update_session` to keep Agent Plans sparse and useful for multi-step work, and to add PR/dashboard external URLs.
     - Use `linear_update_issue_state` for state handoffs. For a direct non-code answer, emit the response activity and move the issue to `Human Review` before ending the turn. For blocked work, emit an elicitation or error and move the issue to `Blocked`.
     - Keep one long-lived issue conversation. Finish this turn when the current prompt is handled; Symphony will wake you on the next AgentSession prompt.
+    - Linear Agent Activities and Agent Plans are the human-facing surfaces. The final assistant message is internal to Symphony logs/dashboard and is not the Linear-facing response.
+    - Before ending a turn, post any answer, question, blocker, or handoff that the human should see through Linear Agent Activity.
+    - Keep the final assistant message to one short sentence summarizing what was completed or what blocked the turn. Do not duplicate the user-facing Linear response there.
+    - Do not include "next steps for the user" in the final assistant message unless the turn is blocked and those unblock steps were also posted visibly in Linear.
     - If repository context is unclear, ask a concise clarification using an elicitation activity and move or leave the issue in Blocked.
     - Resolve repository context agentically: inspect configured local repo roots, `gh`, GitHub, and web context. Clone independent copies into the issue workspace only when the target repo is unambiguous.
     - For PR feedback, read the full PR activity/comments/checks like a coworker, then reply on GitHub where appropriate and summarize in Linear.
@@ -265,7 +269,7 @@ defmodule SymphonyElixir.AgentRunner do
     - If the comments are conversational, approval-like, informational, or ask a direct question that does not require work, leave the issue in Human Review.
     - If a reply is useful, reply in the specific Linear comment thread using `linear_graphql` with `commentCreate(input: {issueId: "#{issue.id}", parentId: "<comment_id>", body: "<short reply>"})`.
     - If no reply is useful, make no text reply.
-    - If the comments request work, first move the issue to Rework, then do the requested work, validate, update the compact Symphony Status comment, and move the issue back to Human Review.
+    - If the comments request work, first move the issue to Rework, then do the requested work, validate, update Agent Activities or Agent Plan if useful, and move the issue back to Human Review.
     - Work can be code, repo maintenance, documentation, investigation, or other task execution. Use judgment.
     - Attach generated files, screenshots, videos, images, logs, and other artifacts with `linear_upload_file` instead of pasting long text.
     - Natural approval comments do not trigger merging. Only the Merging state can trigger landing.

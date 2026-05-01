@@ -71,7 +71,7 @@ No description provided.
 Continuation context:
 
 - This is retry attempt #{{ attempt }}.
-- Resume from the current workspace and Linear status comment instead of restarting.
+- Resume from the current workspace and Linear Agent Activity/Plan context instead of restarting.
 - Keep the update short unless there is a real blocker or meaningful new information.
 {% endif %}
 
@@ -96,6 +96,15 @@ New Linear comment context:
 - Avoid long Definition-of-Done dumps unless the ticket explicitly asks for one.
 - Start in the provided issue scratch workspace. Only clone or attach repositories when the intended repo is definitive and unambiguous.
 - Do not ask humans to perform follow-up actions unless blocked by missing required auth, permissions, tools, or product decisions.
+
+## End-of-Turn Contract
+
+- Linear Agent Activities and Agent Plans are the human-facing surfaces.
+- Before ending a turn, post any answer, question, blocker, or handoff that the human should see through Linear Agent Activity.
+- The final assistant message is internal to Symphony logs/dashboard and is not the Linear-facing response.
+- Keep the final assistant message to one short sentence summarizing what was completed or what blocked the turn.
+- Do not duplicate the user-facing Linear response in the final assistant message.
+- Do not include "next steps for the user" in the final assistant message unless the turn is blocked and those unblock steps were also posted visibly in Linear.
 
 ## Comment Behavior
 
