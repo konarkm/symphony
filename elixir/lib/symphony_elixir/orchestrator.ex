@@ -1090,13 +1090,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp linear_agent_turn_steerable?(_running_entry), do: true
 
   defp dispatch_linear_agent_session_event(state, issue, event, action, agent_session_id) do
-    acknowledge_agent_session(agent_session_id, action)
+    acknowledge_agent_session(agent_session_id, action, issue.id)
 
     runner_opts =
       [
         mode: :linear_agent,
         linear_agent: true,
-        linear_agent_start: linear_agent_start_action?(action),
         agent_session_id: agent_session_id,
         prompt_context: Map.get(event, :prompt_context),
         prompt_body: Map.get(event, :prompt_body),
@@ -1135,12 +1134,6 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp agent_session_id_for_event(event, _issue), do: Map.get(event, :agent_session_id)
 
-  defp linear_agent_start_action?(action)
-       when action in ["created", "prompted", "issueAssignedToYou", "issueStatusChanged"],
-       do: true
-
-  defp linear_agent_start_action?(_action), do: false
-
   defp refresh_linear_agent_issue(%Issue{id: issue_id} = issue) when is_binary(issue_id) and issue_id != "" do
     case Tracker.fetch_issue_states_by_ids([issue_id]) do
       {:ok, [%Issue{} = refreshed | _]} ->
@@ -1158,21 +1151,46 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp refresh_linear_agent_issue(%Issue{} = issue), do: issue
 
-  defp acknowledge_agent_session(nil, _action), do: :ok
+  defp acknowledge_agent_session(nil, _action, _issue_id), do: :ok
 
-  defp acknowledge_agent_session(agent_session_id, "created") when is_binary(agent_session_id) do
-    Agent.create_activity(agent_session_id, %{
-      "type" => "thought",
-      "body" => "I picked this up and am reading the issue context."
-    })
+  defp acknowledge_agent_session(agent_session_id, "created", issue_id)
+       when is_binary(agent_session_id) and is_binary(issue_id) do
+    issue_state = StateStore.get_issue(issue_id)
+
+    if linear_agent_created_ack_needed?(issue_state, agent_session_id) do
+      Agent.create_activity(agent_session_id, %{
+        "type" => "thought",
+        "body" => "I picked this up and am reading the issue context."
+      })
+
+      StateStore.put_issue(issue_id, %{
+        last_acknowledged_agent_session_id: agent_session_id,
+        last_acknowledged_agent_session_at: DateTime.to_iso8601(DateTime.utc_now())
+      })
+    else
+      :ok
+    end
   end
 
-  defp acknowledge_agent_session(agent_session_id, _action) when is_binary(agent_session_id) do
+  defp acknowledge_agent_session(agent_session_id, _action, _issue_id) when is_binary(agent_session_id) do
     Agent.create_activity(agent_session_id, %{
       "type" => "thought",
       "body" => "I saw the new prompt and am checking what needs to change."
     })
   end
+
+  @doc false
+  @spec linear_agent_created_ack_needed_for_test(map(), String.t()) :: boolean()
+  def linear_agent_created_ack_needed_for_test(issue_state, agent_session_id) do
+    linear_agent_created_ack_needed?(issue_state, agent_session_id)
+  end
+
+  defp linear_agent_created_ack_needed?(issue_state, agent_session_id)
+       when is_map(issue_state) and is_binary(agent_session_id) do
+    Map.get(issue_state, "last_acknowledged_agent_session_id") != agent_session_id
+  end
+
+  defp linear_agent_created_ack_needed?(_issue_state, _agent_session_id), do: true
 
   defp linear_agent_prompt(event) do
     [
@@ -1245,8 +1263,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp prepare_issue_for_dispatch(%Issue{} = issue, runner_opts) do
-    if Keyword.get(runner_opts, :linear_agent_start) == true do
-      move_issue_to_started_for_linear_agent(issue)
+    if Keyword.get(runner_opts, :linear_agent) == true do
+      issue
     else
       prepare_issue_for_dispatch(issue)
     end
@@ -1400,7 +1418,6 @@ defmodule SymphonyElixir.Orchestrator do
   defp complete_normal_agent_run(%State{} = state, issue_id, %{mode: :linear_agent}, session_id) do
     Logger.info("Linear Agent turn completed for issue_id=#{issue_id} session_id=#{session_id}; idling issue room")
     initialize_linear_agent_comment_marker(issue_id)
-    ensure_linear_agent_completion_handoff_state(issue_id)
 
     state
     |> complete_issue(issue_id)
@@ -1446,50 +1463,6 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp initialize_linear_agent_comment_marker(_issue_id), do: :ok
-
-  defp ensure_linear_agent_completion_handoff_state(issue_id) when is_binary(issue_id) do
-    case Tracker.fetch_issue_states_by_ids([issue_id]) do
-      {:ok, [%Issue{} = issue | _]} ->
-        maybe_move_unstarted_linear_agent_issue_to_review(issue)
-
-      {:ok, []} ->
-        :ok
-
-      {:error, reason} ->
-        Logger.debug("Unable to verify Linear Agent completion handoff state for issue_id=#{issue_id}: #{inspect(reason)}")
-        :ok
-    end
-  end
-
-  defp ensure_linear_agent_completion_handoff_state(_issue_id), do: :ok
-
-  defp maybe_move_unstarted_linear_agent_issue_to_review(%Issue{state: state_name} = issue) do
-    if linear_agent_completion_needs_review_handoff?(state_name) do
-      case Tracker.update_issue_state(issue.id, @human_review_state) do
-        :ok ->
-          Logger.info("Moved completed Linear Agent issue to Human Review after unstarted-state handoff: #{issue_context(issue)}")
-          :ok
-
-        {:error, reason} ->
-          Logger.warning("Unable to move completed Linear Agent issue to Human Review for #{issue_context(issue)}: #{inspect(reason)}")
-          :ok
-      end
-    else
-      :ok
-    end
-  end
-
-  @doc false
-  @spec linear_agent_completion_needs_review_handoff_for_test(String.t() | nil) :: boolean()
-  def linear_agent_completion_needs_review_handoff_for_test(state_name) do
-    linear_agent_completion_needs_review_handoff?(state_name)
-  end
-
-  defp linear_agent_completion_needs_review_handoff?(state_name) when is_binary(state_name) do
-    normalize_issue_state(state_name) in ["todo", "backlog"]
-  end
-
-  defp linear_agent_completion_needs_review_handoff?(_state_name), do: false
 
   defp complete_issue(%State{} = state, issue_id) do
     %{

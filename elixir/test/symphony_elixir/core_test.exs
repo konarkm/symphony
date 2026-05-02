@@ -1749,6 +1749,11 @@ defmodule SymphonyElixir.CoreTest do
       assert turn_text =~ "The final assistant message is internal to Symphony logs/dashboard"
       assert turn_text =~ "not the Linear-facing response"
       assert turn_text =~ "Do not duplicate the user-facing Linear response there"
+      assert turn_text =~ "Do not change state just because the AgentSession started"
+      assert turn_text =~ "For direct answers, planning discussion, or lightweight questions"
+      assert turn_text =~ "leave the issue state unchanged"
+      assert turn_text =~ "When you begin real implementation or task execution on an unstarted issue, move it to `In Progress`"
+      assert turn_text =~ "For ready handoff after real work, move it to `Human Review`"
       assert turn_text =~ "Agent session id: agent-session-251"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
@@ -1829,7 +1834,7 @@ defmodule SymphonyElixir.CoreTest do
     assert updated_state.running[issue.id].ref == worker_ref
   end
 
-  test "linear agent created event starts delegated backlog issue and moves it to In Progress" do
+  test "linear agent created event starts delegated backlog issue without bridge-owned state change" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1912,8 +1917,6 @@ defmodule SymphonyElixir.CoreTest do
         orchestrator_name
       )
 
-      assert_receive {:memory_tracker_state_update, "issue-linear-agent-backlog-start", "In Progress"}, 1_000
-
       eventually(
         fn ->
           trace = if File.exists?(trace_file), do: File.read!(trace_file), else: ""
@@ -1921,6 +1924,8 @@ defmodule SymphonyElixir.CoreTest do
         end,
         80
       )
+
+      refute_received {:memory_tracker_state_update, "issue-linear-agent-backlog-start", _state}
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
@@ -1928,7 +1933,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "linear agent issue status event starts delegated backlog issue and moves it to In Progress" do
+  test "linear agent issue status event starts delegated backlog issue without bridge-owned state change" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -2011,8 +2016,6 @@ defmodule SymphonyElixir.CoreTest do
         orchestrator_name
       )
 
-      assert_receive {:memory_tracker_state_update, "issue-linear-agent-status-start", "In Progress"}, 1_000
-
       eventually(
         fn ->
           trace = if File.exists?(trace_file), do: File.read!(trace_file), else: ""
@@ -2020,6 +2023,8 @@ defmodule SymphonyElixir.CoreTest do
         end,
         80
       )
+
+      refute_received {:memory_tracker_state_update, "issue-linear-agent-status-start", _state}
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
@@ -2548,12 +2553,18 @@ defmodule SymphonyElixir.CoreTest do
     refute Orchestrator.linear_agent_session_poll_candidate_for_test(backlog_issue, "complete")
   end
 
-  test "linear agent completion handoff treats unstarted states as ready for review" do
-    assert Orchestrator.linear_agent_completion_needs_review_handoff_for_test("Todo")
-    assert Orchestrator.linear_agent_completion_needs_review_handoff_for_test("Backlog")
-    refute Orchestrator.linear_agent_completion_needs_review_handoff_for_test("In Progress")
-    refute Orchestrator.linear_agent_completion_needs_review_handoff_for_test("Blocked")
-    refute Orchestrator.linear_agent_completion_needs_review_handoff_for_test("Human Review")
+  test "linear agent created acknowledgement is deduped per AgentSession" do
+    assert Orchestrator.linear_agent_created_ack_needed_for_test(%{}, "session-1")
+
+    refute Orchestrator.linear_agent_created_ack_needed_for_test(
+             %{"last_acknowledged_agent_session_id" => "session-1"},
+             "session-1"
+           )
+
+    assert Orchestrator.linear_agent_created_ack_needed_for_test(
+             %{"last_acknowledged_agent_session_id" => "session-1"},
+             "session-2"
+           )
   end
 
   test "linear agent retries once with a fresh thread when resumed thread is interrupted" do
