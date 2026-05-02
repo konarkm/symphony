@@ -42,6 +42,35 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert Bitwise.band(mode, 0o777) == 0o600
   end
 
+  test "OAuth detects expired and still-valid token lifetimes" do
+    now = System.system_time(:second)
+
+    refute OAuth.expired_or_expiring?(%{
+             "access_token" => "token",
+             "created_at" => now,
+             "expires_in" => 86_400
+           })
+
+    assert OAuth.expired_or_expiring?(%{
+             "access_token" => "token",
+             "created_at" => now - 86_200,
+             "expires_in" => 86_400
+           })
+
+    refute OAuth.expired_or_expiring?(%{"access_token" => "legacy-token"})
+  end
+
+  test "OAuth access token refresh path requires a refresh token when expired" do
+    now = System.system_time(:second)
+
+    assert {:error, :missing_linear_oauth_refresh_token} =
+             OAuth.refresh_if_needed(%{
+               "access_token" => "expired-token",
+               "created_at" => now - 86_500,
+               "expires_in" => 86_400
+             })
+  end
+
   test "AgentSession webhook normalizes created and prompted context" do
     payload = %{
       "action" => "prompted",

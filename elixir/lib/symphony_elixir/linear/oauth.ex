@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Linear.OAuth do
   @auth_url "https://linear.app/oauth/authorize"
   @token_url "https://api.linear.app/oauth/token"
   @required_scopes ["read", "write", "comments:create", "app:assignable", "app:mentionable"]
+  @refresh_skew_seconds 300
 
   @type token :: %{optional(String.t()) => term()}
 
@@ -83,11 +84,59 @@ defmodule SymphonyElixir.Linear.OAuth do
   @spec access_token() :: {:ok, String.t()} | {:error, term()}
   def access_token do
     with {:ok, token} <- load_token(),
+         {:ok, token} <- refresh_if_needed(token),
          access_token when is_binary(access_token) <- Map.get(token, "access_token") do
       {:ok, access_token}
     else
       {:error, reason} -> {:error, reason}
       _ -> {:error, :missing_linear_oauth_access_token}
+    end
+  end
+
+  @spec refresh_if_needed(token()) :: {:ok, token()} | {:error, term()}
+  def refresh_if_needed(token) when is_map(token) do
+    if expired_or_expiring?(token) do
+      refresh_token(token)
+    else
+      {:ok, token}
+    end
+  end
+
+  @spec expired_or_expiring?(token()) :: boolean()
+  def expired_or_expiring?(token) when is_map(token) do
+    case {Map.get(token, "created_at"), Map.get(token, "expires_in")} do
+      {created_at, expires_in} when is_integer(created_at) and is_integer(expires_in) ->
+        System.system_time(:second) + @refresh_skew_seconds >= created_at + expires_in
+
+      _ ->
+        false
+    end
+  end
+
+  @spec refresh_token(token()) :: {:ok, token()} | {:error, term()}
+  def refresh_token(token) when is_map(token) do
+    settings = Config.settings!().linear_agent
+
+    with refresh_token when is_binary(refresh_token) <- Map.get(token, "refresh_token"),
+         client_id when is_binary(client_id) <- settings.client_id,
+         client_secret when is_binary(client_secret) <- settings.client_secret,
+         {:ok, refreshed} <-
+           Req.post(@token_url,
+             form: [
+               grant_type: "refresh_token",
+               refresh_token: refresh_token,
+               client_id: client_id,
+               client_secret: client_secret
+             ],
+             connect_options: [timeout: 30_000]
+           )
+           |> normalize_token_response(),
+         :ok <- save_token(refreshed) do
+      {:ok, refreshed}
+    else
+      nil -> {:error, :missing_linear_oauth_refresh_token}
+      {:error, reason} -> {:error, reason}
+      other -> {:error, other}
     end
   end
 
