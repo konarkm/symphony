@@ -282,7 +282,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert_receive {:graphql_called, comments_query, %{first: 50, issueId: "issue-1"}}
     assert comments_query =~ "comments"
-    refute comments_query =~ "isBot"
+    assert comments_query =~ "isBot"
 
     Process.put({FakeLinearClient, :graphql_result}, {:error, :boom})
     assert {:error, :boom} = Adapter.fetch_issue_comments("issue-1")

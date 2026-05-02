@@ -2444,6 +2444,86 @@ defmodule SymphonyElixir.CoreTest do
     refute_receive {:memory_tracker_comment_reply, _, _, _}, 100
   end
 
+  test "linear agent comment polling uses local state marker instead of status comment" do
+    state_path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-linear-agent-polled-comment-state-#{System.unique_integer([:positive])}.json"
+      )
+
+    {:ok, old_time, _offset} = DateTime.from_iso8601("2026-04-30T12:00:00Z")
+    {:ok, comment_time, _offset} = DateTime.from_iso8601("2026-04-30T12:01:00Z")
+
+    issue = %Issue{
+      id: "issue-linear-agent-polled-comment",
+      identifier: "MT-258",
+      title: "Polled comment issue",
+      description: "Human Review comments should still wake the Linear Agent path",
+      state: "Human Review",
+      labels: []
+    }
+
+    old_comment = %Comment{
+      id: "linear-agent-old-comment",
+      body: "9 * 9 = 81.",
+      created_at: old_time,
+      updated_at: old_time,
+      author_name: "Symphony",
+      author_is_bot: true
+    }
+
+    human_comment = %Comment{
+      id: "linear-agent-polled-human-comment",
+      body: "Saw this. Please confirm briefly.",
+      created_at: comment_time,
+      updated_at: comment_time,
+      author_name: "Konark M",
+      author_is_bot: false
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+      issue.id => [old_comment, human_comment]
+    })
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      linear_agent_enabled: true,
+      linear_agent_state_path: state_path
+    )
+
+    on_exit(fn -> File.rm_rf(state_path) end)
+
+    :ok =
+      SymphonyElixir.StateStore.put_issue(issue.id, %{
+        agent_session_id: "agent-session-258",
+        thread_id: "thread-258",
+        last_seen_comment_id: old_comment.id,
+        last_seen_comment_updated_at: DateTime.to_iso8601(old_time)
+      })
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 0,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    _updated_state = Orchestrator.poll_comment_steering_for_test(state)
+
+    assert_receive {:memory_tracker_comment_reaction, "linear-agent-polled-human-comment", "eyes"}
+    refute_receive {:memory_tracker_comment_update, _, _}, 100
+
+    issue_state = SymphonyElixir.StateStore.get_issue(issue.id)
+    assert issue_state["agent_session_id"] == "agent-session-258"
+    assert issue_state["thread_id"] == "thread-258"
+    assert issue_state["last_seen_comment_id"] == "linear-agent-polled-human-comment"
+  end
+
   test "linear agent retries once with a fresh thread when resumed thread is interrupted" do
     test_root =
       Path.join(

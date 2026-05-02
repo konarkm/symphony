@@ -39,6 +39,7 @@ defmodule SymphonyElixir.Linear.Adapter do
             id
             name
             displayName
+            isBot
           }
         }
       }

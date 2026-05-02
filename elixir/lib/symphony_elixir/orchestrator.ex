@@ -820,6 +820,9 @@ defmodule SymphonyElixir.Orchestrator do
       state
     else
       case StateStore.put_issue(issue.id, %{
+             last_seen_comment_id: comment.id,
+             last_seen_comment_updated_at: comment_timestamp_iso8601(comment),
+             paused: Map.get(issue_state, "paused") == true,
              last_command: "unknown",
              last_command_comment_id: comment.id,
              last_command_at: DateTime.to_iso8601(DateTime.utc_now())
@@ -856,6 +859,8 @@ defmodule SymphonyElixir.Orchestrator do
       paused? = bridge_command_paused_after(command, marker)
 
       case StateStore.put_issue(issue.id, %{
+             last_seen_comment_id: comment.id,
+             last_seen_comment_updated_at: comment_timestamp_iso8601(comment),
              paused: paused?,
              last_command: command.action_text,
              last_command_comment_id: comment.id,
@@ -912,6 +917,59 @@ defmodule SymphonyElixir.Orchestrator do
     #{body}
     """
   end
+
+  defp linear_agent_comment_batch_prompt(comments) when is_list(comments) do
+    """
+    New top-level Linear issue comment context arrived:
+
+    #{CommentSteering.format_review_context(comments)}
+    """
+  end
+
+  defp latest_agent_session_id_for_issue(%Issue{id: issue_id}) when is_binary(issue_id) do
+    case Agent.latest_session_id_for_issue(issue_id) do
+      {:ok, session_id} -> session_id
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp latest_agent_session_id_for_issue(_issue), do: nil
+
+  defp linear_agent_comment_marker_state(issue_id) when is_binary(issue_id) do
+    issue_state = StateStore.get_issue(issue_id)
+
+    marker = %{
+      last_seen_comment_id: Map.get(issue_state, "last_seen_comment_id"),
+      last_seen_comment_updated_at: Map.get(issue_state, "last_seen_comment_updated_at"),
+      paused: Map.get(issue_state, "paused") == true
+    }
+
+    with id when is_binary(id) and id != "" <- marker.last_seen_comment_id,
+         updated_at when is_binary(updated_at) <- marker.last_seen_comment_updated_at,
+         {:ok, %DateTime{}, _offset} <- DateTime.from_iso8601(updated_at) do
+      {:ok, marker}
+    else
+      _ -> :missing
+    end
+  end
+
+  defp persist_latest_linear_agent_comment_marker(issue_id, comments) when is_binary(issue_id) and is_list(comments) do
+    comments
+    |> CommentSteering.latest_marker()
+    |> persist_linear_agent_comment_marker(issue_id)
+  end
+
+  defp persist_linear_agent_comment_marker(marker, issue_id) when is_map(marker) and is_binary(issue_id) do
+    StateStore.put_issue(issue_id, %{
+      last_seen_comment_id: marker[:last_seen_comment_id],
+      last_seen_comment_updated_at: marker[:last_seen_comment_updated_at],
+      paused: CommentSteering.paused?(marker)
+    })
+  end
+
+  defp comment_timestamp_iso8601(%Comment{created_at: %DateTime{} = created_at}), do: DateTime.to_iso8601(created_at)
+  defp comment_timestamp_iso8601(%Comment{updated_at: %DateTime{} = updated_at}), do: DateTime.to_iso8601(updated_at)
+  defp comment_timestamp_iso8601(_comment), do: DateTime.to_iso8601(DateTime.utc_now())
 
   defp linear_agent_issue_paused?(issue_id) when is_binary(issue_id) do
     StateStore.get_issue(issue_id)
@@ -1262,6 +1320,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp complete_normal_agent_run(%State{} = state, issue_id, %{mode: :linear_agent}, session_id) do
     Logger.info("Linear Agent turn completed for issue_id=#{issue_id} session_id=#{session_id}; idling issue room")
+    initialize_linear_agent_comment_marker(issue_id)
 
     state
     |> complete_issue(issue_id)
@@ -1294,6 +1353,19 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_store_linear_agent_thread(_issue_id, _running_entry), do: :ok
+
+  defp initialize_linear_agent_comment_marker(issue_id) when is_binary(issue_id) do
+    case Tracker.fetch_issue_comments(issue_id) do
+      {:ok, comments} when is_list(comments) ->
+        persist_latest_linear_agent_comment_marker(issue_id, comments)
+
+      {:error, reason} ->
+        Logger.debug("Unable to initialize Linear Agent comment marker for issue_id=#{issue_id}: #{inspect(reason)}")
+        :ok
+    end
+  end
+
+  defp initialize_linear_agent_comment_marker(_issue_id), do: :ok
 
   defp complete_issue(%State{} = state, issue_id) do
     %{
@@ -1438,11 +1510,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
 
   defp poll_comment_steering(%State{} = state) do
-    if Config.settings!().linear_agent.enabled do
-      state
-    else
-      do_poll_comment_steering(state)
-    end
+    do_poll_comment_steering(state)
   end
 
   defp do_poll_comment_steering(%State{} = state) do
@@ -1545,12 +1613,20 @@ defmodule SymphonyElixir.Orchestrator do
   defp issue_paused_by_marker?(_issue), do: false
 
   defp handle_issue_comments(state, issue_id, issue, entry, comments) when is_list(comments) do
+    if Config.settings!().linear_agent.enabled do
+      handle_linear_agent_polled_issue_comments(state, issue_id, issue, entry, comments)
+    else
+      handle_status_comment_steering_issue_comments(state, issue_id, issue, entry, comments)
+    end
+  end
+
+  defp handle_status_comment_steering_issue_comments(state, issue_id, issue, entry, comments) do
     status_comment = CommentSteering.find_status_comment(comments)
     marker_state = CommentSteering.marker_from_comment(status_comment)
     actionable_comments = CommentSteering.actionable_comments(comments, marker_state)
 
     cond do
-      marker_state in [:missing, :invalid] ->
+      marker_state == :missing ->
         marker = CommentSteering.latest_marker(comments)
 
         :ok =
@@ -1571,6 +1647,82 @@ defmodule SymphonyElixir.Orchestrator do
           marker_state,
           actionable_comments
         )
+    end
+  end
+
+  defp handle_linear_agent_polled_issue_comments(state, issue_id, issue, entry, comments) do
+    marker_state = linear_agent_comment_marker_state(issue_id)
+    actionable_comments = CommentSteering.actionable_comments(comments, marker_state)
+
+    cond do
+      marker_state == :missing ->
+        persist_latest_linear_agent_comment_marker(issue_id, comments)
+        state
+
+      actionable_comments == [] ->
+        state
+
+      true ->
+        process_linear_agent_polled_comments(state, issue_id, issue, entry, marker_state, actionable_comments)
+    end
+  end
+
+  defp process_linear_agent_polled_comments(state, issue_id, issue, entry, {:ok, marker}, comments) do
+    accumulator = %{
+      state: state,
+      marker: marker,
+      worker_comments: []
+    }
+
+    comments
+    |> Enum.reduce(accumulator, fn comment, acc ->
+      if BridgeCommand.command?(comment) do
+        acc
+        |> flush_worker_comments(issue_id, issue, entry)
+        |> process_linear_agent_polled_bridge_command(issue, comment)
+      else
+        process_linear_agent_polled_worker_comment(acc, issue.id, comment)
+      end
+    end)
+    |> flush_worker_comments(issue_id, issue, entry)
+    |> Map.fetch!(:state)
+  end
+
+  defp process_linear_agent_polled_comments(state, _issue_id, _issue, _entry, _marker_state, _comments), do: state
+
+  defp process_linear_agent_polled_bridge_command(acc, %Issue{} = issue, %Comment{} = comment) do
+    state =
+      case BridgeCommand.parse(comment) do
+        {:ok, command} -> apply_linear_agent_bridge_command(acc.state, issue, comment, command)
+        {:error, :unknown_command, unknown} -> apply_unknown_linear_agent_bridge_command(acc.state, issue, comment, unknown)
+        :not_command -> acc.state
+      end
+
+    marker =
+      acc.marker
+      |> CommentSteering.advance_marker(comment)
+      |> Map.put(:paused, linear_agent_issue_paused?(issue.id))
+
+    %{acc | state: state, marker: marker}
+  end
+
+  defp process_linear_agent_polled_worker_comment(acc, issue_id, %Comment{} = comment) do
+    acknowledge_comment(comment)
+
+    marker = CommentSteering.advance_marker(acc.marker, comment)
+
+    case persist_linear_agent_comment_marker(marker, issue_id) do
+      :ok ->
+        if CommentSteering.paused?(marker) do
+          Logger.info("Issue is paused; acknowledged non-command Linear comment without worker routing for issue_id=#{issue_id}")
+          %{acc | marker: marker}
+        else
+          %{acc | marker: marker, worker_comments: acc.worker_comments ++ [comment]}
+        end
+
+      {:error, reason} ->
+        Logger.warning("Skipping Linear Agent comment routing after local marker write failure for issue_id=#{issue_id}: #{inspect(reason)}")
+        %{acc | marker: marker}
     end
   end
 
@@ -1853,7 +2005,35 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp route_comment_steering(%State{} = state, _issue_id, %Issue{} = issue, {:human_review, _entry}, comments, _message) do
-    dispatch_review_comment_issue(state, issue, comments)
+    if Config.settings!().linear_agent.enabled do
+      route_linear_agent_polled_comments(state, issue, comments)
+    else
+      dispatch_review_comment_issue(state, issue, comments)
+    end
+  end
+
+  defp route_linear_agent_polled_comments(%State{} = state, %Issue{} = issue, comments) do
+    issue_state = StateStore.get_issue(issue.id)
+
+    agent_session_id =
+      Map.get(issue_state, "agent_session_id") ||
+        get_in(state.running, [issue.id, :agent_session_id]) ||
+        latest_agent_session_id_for_issue(issue)
+
+    if is_binary(agent_session_id) and agent_session_id != "" do
+      Logger.info("Routing #{length(comments)} Linear issue comment(s) into native AgentSession for #{issue_context(issue)}")
+
+      handle_linear_agent_session_event(state, %{
+        action: "prompted",
+        agent_session_id: agent_session_id,
+        issue: issue,
+        prompt_body: linear_agent_comment_batch_prompt(comments),
+        prompt_context: nil
+      })
+    else
+      Logger.info("Ignoring non-command Linear issue comment without known AgentSession for #{issue_context(issue)}")
+      state
+    end
   end
 
   defp running_turn_active?(%{pid: pid, thread_id: thread_id, active_turn_id: active_turn_id})
