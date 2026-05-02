@@ -40,6 +40,20 @@ defmodule SymphonyElixir.Linear.Agent do
   }
   """
 
+  @latest_session_for_issue_query """
+  query SymphonyLatestAgentSessionForIssue {
+    agentSessions(first: 50, orderBy: createdAt) {
+      nodes {
+        id
+        status
+        issue {
+          id
+        }
+      }
+    }
+  }
+  """
+
   @type event :: %{
           action: String.t(),
           agent_session_id: String.t() | nil,
@@ -90,6 +104,28 @@ defmodule SymphonyElixir.Linear.Agent do
       {:error, reason} -> {:error, reason}
     end
   end
+
+  @spec latest_session_id_for_issue(String.t()) :: {:ok, String.t() | nil} | {:error, term()}
+  def latest_session_id_for_issue(issue_id) when is_binary(issue_id) and issue_id != "" do
+    with {:ok, response} <- Client.graphql(@latest_session_for_issue_query, %{}) do
+      session_id =
+        response
+        |> get_in(["data", "agentSessions", "nodes"])
+        |> List.wrap()
+        |> Enum.find_value(fn
+          %{"id" => id, "issue" => %{"id" => ^issue_id}, "status" => status}
+          when status in ["active", "stale"] ->
+            id
+
+          _ ->
+            nil
+        end)
+
+      {:ok, session_id}
+    end
+  end
+
+  def latest_session_id_for_issue(_issue_id), do: {:ok, nil}
 
   @spec validate_required_statuses([String.t()]) :: :ok | {:error, map()}
   def validate_required_statuses(required_statuses) when is_list(required_statuses) do

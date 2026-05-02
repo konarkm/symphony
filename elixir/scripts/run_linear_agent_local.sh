@@ -23,7 +23,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Start Symphony in another terminal with:"
-echo "  mise exec -- ./bin/symphony --i-understand-that-this-will-be-running-without-the-usual-guardrails --port ${PORT} ${WORKFLOW}"
+echo "  mise exec -- mix build && mise exec -- ./bin/symphony --i-understand-that-this-will-be-running-without-the-usual-guardrails --port ${PORT} ${WORKFLOW}"
 echo
 echo "Use the printed cloudflared https URL with Linear's webhook settings and path /webhooks/linear-agent."
 

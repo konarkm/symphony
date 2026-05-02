@@ -1829,6 +1829,204 @@ defmodule SymphonyElixir.CoreTest do
     assert updated_state.running[issue.id].ref == worker_ref
   end
 
+  test "linear agent created event starts delegated backlog issue and moves it to In Progress" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-linear-agent-backlog-start-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(workspace_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$line" in
+          *'"id":1'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-backlog-start"}}}'
+            ;;
+          *'"method":"turn/start"'*)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-backlog-start"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      issue = %Issue{
+        id: "issue-linear-agent-backlog-start",
+        identifier: "MT-260",
+        title: "Backlog delegated issue",
+        description: "10*2.5",
+        state: "Backlog",
+        url: "https://example.org/issues/MT-260",
+        labels: []
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        linear_agent_enabled: true,
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        prompt: "Base issue prompt for {{ issue.identifier }}"
+      )
+
+      orchestrator_name = Module.concat(__MODULE__, :LinearAgentBacklogStartOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+
+        System.delete_env("SYMP_TEST_CODEx_TRACE")
+        Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+        File.rm_rf(test_root)
+      end)
+
+      Orchestrator.handle_agent_session_event(
+        %{
+          action: "created",
+          agent_session_id: "agent-session-260",
+          prompt_body: nil,
+          prompt_context: "<issue identifier=\"MT-260\"><title>Backlog delegated issue</title></issue>",
+          issue: issue
+        },
+        orchestrator_name
+      )
+
+      assert_receive {:memory_tracker_state_update, "issue-linear-agent-backlog-start", "In Progress"}, 1_000
+
+      eventually(
+        fn ->
+          trace = if File.exists?(trace_file), do: File.read!(trace_file), else: ""
+          assert trace =~ "\"method\":\"initialize\""
+        end,
+        80
+      )
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "linear agent issue status event starts delegated backlog issue and moves it to In Progress" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-linear-agent-status-start-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(workspace_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$line" in
+          *'"id":1'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-status-start"}}}'
+            ;;
+          *'"method":"turn/start"'*)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-status-start"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      issue = %Issue{
+        id: "issue-linear-agent-status-start",
+        identifier: "MT-261",
+        title: "Backlog delegated issue",
+        description: "10*2.5",
+        state: "Backlog",
+        url: "https://example.org/issues/MT-261",
+        labels: []
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        linear_agent_enabled: true,
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        prompt: "Base issue prompt for {{ issue.identifier }}"
+      )
+
+      orchestrator_name = Module.concat(__MODULE__, :LinearAgentStatusStartOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+
+        System.delete_env("SYMP_TEST_CODEx_TRACE")
+        Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+        File.rm_rf(test_root)
+      end)
+
+      Orchestrator.handle_agent_session_event(
+        %{
+          action: "issueStatusChanged",
+          agent_session_id: "agent-session-261",
+          prompt_body: nil,
+          prompt_context: "<issue identifier=\"MT-261\"><title>Backlog delegated issue</title></issue>",
+          issue: issue
+        },
+        orchestrator_name
+      )
+
+      assert_receive {:memory_tracker_state_update, "issue-linear-agent-status-start", "In Progress"}, 1_000
+
+      eventually(
+        fn ->
+          trace = if File.exists?(trace_file), do: File.read!(trace_file), else: ""
+          assert trace =~ "\"method\":\"initialize\""
+        end,
+        80
+      )
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      File.rm_rf(test_root)
+    end
+  end
+
   test "linear agent prompted event dispatches next turn after previous turn completed" do
     test_root =
       Path.join(
@@ -2330,6 +2528,95 @@ defmodule SymphonyElixir.CoreTest do
       assert trace =~ "\"threadId\":\"old-thread\""
       assert trace =~ "\"method\":\"thread/start\""
       assert trace =~ "Base issue prompt for MT-253"
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "linear agent retries once with a fresh thread when a new thread is interrupted" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-linear-agent-fresh-thread-interrupted-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+      interrupted_marker = Path.join(test_root, "interrupted-once")
+
+      File.mkdir_p!(workspace_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      interrupted_marker="#{interrupted_marker}"
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$line" in
+          *'"id":1'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            if [ ! -f "$interrupted_marker" ]; then
+              printf '%s\\n' '{"id":2,"result":{"thread":{"id":"interrupted-thread"}}}'
+            else
+              printf '%s\\n' '{"id":2,"result":{"thread":{"id":"recovered-thread"}}}'
+            fi
+            ;;
+          *'"method":"turn/start"'*)
+            if [ ! -f "$interrupted_marker" ]; then
+              touch "$interrupted_marker"
+              printf '%s\\n' '{"id":3,"result":{"turn":{"id":"cancelled-turn"}}}'
+              printf '%s\\n' '{"method":"turn/cancelled","params":{"reason":"interrupted"}}'
+              exit 0
+            else
+              printf '%s\\n' '{"id":3,"result":{"turn":{"id":"recovered-turn"}}}'
+              printf '%s\\n' '{"method":"turn/completed"}'
+              exit 0
+            fi
+            ;;
+          *)
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        prompt: "Base issue prompt for {{ issue.identifier }}"
+      )
+
+      issue = %Issue{
+        id: "issue-linear-agent-fresh-interrupted",
+        identifier: "MT-254",
+        title: "Recover interrupted fresh thread",
+        description: "Retry on fresh thread",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-254",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run(
+                 issue,
+                 nil,
+                 linear_agent: true,
+                 agent_session_id: "agent-session-254"
+               )
+
+      trace = File.read!(trace_file)
+      assert trace |> String.split(~S("method":"thread/start")) |> length() == 3
+      assert trace =~ "recovered-thread"
+      assert trace =~ "Base issue prompt for MT-254"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)

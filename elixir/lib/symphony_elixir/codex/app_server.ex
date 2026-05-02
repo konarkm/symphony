@@ -370,7 +370,12 @@ defmodule SymphonyElixir.Codex.AppServer do
       "params" => %{
         "threadId" => thread_id,
         "expectedTurnId" => turn_id,
-        "input" => input
+        "input" => [
+          %{
+            "type" => "text",
+            "text" => input
+          }
+        ]
       }
     })
 

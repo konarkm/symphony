@@ -286,7 +286,12 @@ defmodule SymphonyElixir.AppServerTest do
                    payload["method"] == "turn/steer" &&
                      get_in(payload, ["params", "threadId"]) == "thread-steer" &&
                      get_in(payload, ["params", "expectedTurnId"]) == "turn-steer" &&
-                     get_in(payload, ["params", "input"]) == "Use the newest Linear comment."
+                     get_in(payload, ["params", "input"]) == [
+                       %{
+                         "type" => "text",
+                         "text" => "Use the newest Linear comment."
+                       }
+                     ]
                  end)
                else
                  false

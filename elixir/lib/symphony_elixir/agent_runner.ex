@@ -101,8 +101,8 @@ defmodule SymphonyElixir.AgentRunner do
         start_opts
       )
 
-    if retry_linear_agent_with_fresh_thread?(result, opts, existing_thread_id) do
-      Logger.warning("Linear Agent resumed thread was interrupted for #{issue_context(issue)}; retrying once with a fresh Codex thread")
+    if retry_linear_agent_with_fresh_thread?(result, opts) do
+      Logger.warning("Linear Agent thread was interrupted for #{issue_context(issue)}; retrying once with a fresh Codex thread")
 
       run_codex_session_with_opts(
         workspace,
@@ -145,14 +145,12 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp retry_linear_agent_with_fresh_thread?({:error, {:turn_cancelled, params}}, opts, existing_thread_id) do
+  defp retry_linear_agent_with_fresh_thread?({:error, {:turn_cancelled, params}}, opts) do
     Keyword.get(opts, :linear_agent) == true and
-      is_binary(existing_thread_id) and
-      existing_thread_id != "" and
       interrupted_turn_cancelled?(params)
   end
 
-  defp retry_linear_agent_with_fresh_thread?(_result, _opts, _existing_thread_id), do: false
+  defp retry_linear_agent_with_fresh_thread?(_result, _opts), do: false
 
   defp interrupted_turn_cancelled?(params) when is_map(params) do
     reason = Map.get(params, "reason") || Map.get(params, :reason)

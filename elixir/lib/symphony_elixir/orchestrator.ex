@@ -776,9 +776,10 @@ defmodule SymphonyElixir.Orchestrator do
     event = Map.put(event, :issue, issue)
 
     case Map.get(event, :action) do
-      action when action in ["created", "prompted"] ->
-        agent_session_id = Map.get(event, :agent_session_id)
+      action when action in ["created", "prompted", "issueAssignedToYou", "issueStatusChanged"] ->
+        agent_session_id = agent_session_id_for_event(event, issue)
         prompt = linear_agent_prompt(event)
+        Logger.info("Linear AgentSession action=#{action} session_id=#{agent_session_id || "unknown"} #{issue_context(issue)} state=#{issue.state || "unknown"}")
 
         case Map.get(state.running, issue.id) do
           %{pid: pid} = running_entry when is_pid(pid) ->
@@ -958,6 +959,7 @@ defmodule SymphonyElixir.Orchestrator do
       [
         mode: :linear_agent,
         linear_agent: true,
+        linear_agent_start: linear_agent_start_action?(action),
         agent_session_id: agent_session_id,
         prompt_context: Map.get(event, :prompt_context),
         prompt_body: Map.get(event, :prompt_body),
@@ -976,6 +978,31 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_steer_running_linear_agent(_pid, _event, _prompt), do: :ok
+
+  defp agent_session_id_for_event(event, %Issue{id: issue_id}) do
+    case Map.get(event, :agent_session_id) do
+      value when is_binary(value) and value != "" ->
+        value
+
+      _ ->
+        case Agent.latest_session_id_for_issue(issue_id) do
+          {:ok, session_id} ->
+            session_id
+
+          {:error, reason} ->
+            Logger.warning("Unable to find active Linear AgentSession for issue_id=#{issue_id}: #{inspect(reason)}")
+            nil
+        end
+    end
+  end
+
+  defp agent_session_id_for_event(event, _issue), do: Map.get(event, :agent_session_id)
+
+  defp linear_agent_start_action?(action)
+       when action in ["created", "prompted", "issueAssignedToYou", "issueStatusChanged"],
+       do: true
+
+  defp linear_agent_start_action?(_action), do: false
 
   defp refresh_linear_agent_issue(%Issue{id: issue_id} = issue) when is_binary(issue_id) and issue_id != "" do
     case Tracker.fetch_issue_states_by_ids([issue_id]) do
@@ -1067,7 +1094,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, runner_opts) do
-    issue = prepare_issue_for_dispatch(issue)
+    issue = prepare_issue_for_dispatch(issue, runner_opts)
     recipient = self()
 
     case select_worker_host(state, preferred_worker_host) do
@@ -1080,16 +1107,33 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp prepare_issue_for_dispatch(%Issue{state: state_name} = issue)
-       when is_binary(state_name) do
-    if normalize_issue_state(state_name) == "todo" do
-      move_issue_to_in_progress(issue)
+  defp prepare_issue_for_dispatch(%Issue{} = issue, runner_opts) do
+    if Keyword.get(runner_opts, :linear_agent_start) == true do
+      move_issue_to_started_for_linear_agent(issue)
     else
-      issue
+      prepare_issue_for_dispatch(issue)
     end
   end
 
+  defp prepare_issue_for_dispatch(%Issue{state: state_name} = issue)
+       when is_binary(state_name) do
+    move_issue_to_started_for_linear_agent(issue)
+  end
+
   defp prepare_issue_for_dispatch(issue), do: issue
+
+  defp move_issue_to_started_for_linear_agent(%Issue{state: state_name} = issue)
+       when is_binary(state_name) do
+    normalized = normalize_issue_state(state_name)
+
+    if normalized in ["in progress", "blocked", "human review", "rework", "merging", "done", "canceled", "cancelled", "duplicate", "closed"] do
+      issue
+    else
+      move_issue_to_in_progress(issue)
+    end
+  end
+
+  defp move_issue_to_started_for_linear_agent(issue), do: move_issue_to_in_progress(issue)
 
   defp move_issue_to_in_progress(%Issue{id: issue_id} = issue) when is_binary(issue_id) do
     case Tracker.update_issue_state(issue_id, "In Progress") do
