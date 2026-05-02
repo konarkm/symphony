@@ -97,6 +97,77 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert event.issue.labels == ["symphony"]
   end
 
+  test "latest AgentSession lookup picks newest issue session regardless of status" do
+    response = %{
+      "data" => %{
+        "agentSessions" => %{
+          "nodes" => [
+            %{
+              "id" => "old-active-session",
+              "status" => "active",
+              "createdAt" => "2026-05-02T09:00:00Z",
+              "issue" => %{"id" => "issue-1"}
+            },
+            %{
+              "id" => "new-completed-session",
+              "status" => "completed",
+              "createdAt" => "2026-05-02T10:00:00Z",
+              "issue" => %{"id" => "issue-1"}
+            },
+            %{
+              "id" => "other-issue-session",
+              "status" => "active",
+              "createdAt" => "2026-05-02T11:00:00Z",
+              "issue" => %{"id" => "issue-2"}
+            }
+          ]
+        }
+      }
+    }
+
+    assert Agent.latest_session_id_from_response_for_test(response, "issue-1") == "new-completed-session"
+  end
+
+  test "recent AgentSession lookup normalizes issue context for poll fallback" do
+    response = %{
+      "data" => %{
+        "agentSessions" => %{
+          "nodes" => [
+            %{
+              "id" => "session-older",
+              "status" => "active",
+              "createdAt" => "2026-05-02T09:00:00Z",
+              "issue" => %{
+                "id" => "issue-1",
+                "identifier" => "KM-1",
+                "title" => "Older issue",
+                "state" => %{"name" => "Todo"},
+                "labels" => %{"nodes" => []}
+              }
+            },
+            %{
+              "id" => "session-newer",
+              "status" => "stale",
+              "createdAt" => "2026-05-02T10:00:00Z",
+              "issue" => %{
+                "id" => "issue-2",
+                "identifier" => "KM-2",
+                "title" => "Newer issue",
+                "state" => %{"name" => "Backlog"},
+                "labels" => %{"nodes" => [%{"name" => "Symphony"}]}
+              }
+            }
+          ]
+        }
+      }
+    }
+
+    assert [
+             %{id: "session-newer", status: "stale", issue: %{identifier: "KM-2", state: "Backlog"}},
+             %{id: "session-older", status: "active", issue: %{identifier: "KM-1", state: "Todo"}}
+           ] = Agent.recent_sessions_from_response_for_test(response)
+  end
+
   test "state store persists long-lived issue thread metadata" do
     state_path = Path.join(System.tmp_dir!(), "symphony-state-#{System.unique_integer([:positive])}.json")
 

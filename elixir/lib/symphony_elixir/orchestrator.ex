@@ -253,10 +253,83 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_dispatch(%State{} = state) do
     if Config.settings!().linear_agent.enabled do
-      reconcile_running_issues(state)
+      state
+      |> reconcile_running_issues()
+      |> maybe_dispatch_linear_agent_sessions()
     else
       maybe_dispatch_polling(state)
     end
+  end
+
+  defp maybe_dispatch_linear_agent_sessions(%State{} = state) do
+    with :ok <- Config.validate!(),
+         true <- available_slots(state) > 0,
+         {:ok, sessions} <- Agent.recent_sessions() do
+      sessions
+      |> Enum.reduce(state, &maybe_dispatch_linear_agent_session/2)
+    else
+      {:error, reason} ->
+        Logger.error("Failed to fetch Linear AgentSessions: #{inspect(reason)}")
+        state
+
+      false ->
+        state
+    end
+  end
+
+  defp maybe_dispatch_linear_agent_session(%{id: session_id, issue: %Issue{} = issue, status: status}, %State{} = state)
+       when is_binary(session_id) do
+    cond do
+      not linear_agent_session_poll_status?(status) ->
+        state
+
+      not linear_agent_session_issue_dispatchable?(issue) ->
+        state
+
+      linear_agent_issue_paused?(issue.id) ->
+        state
+
+      Map.has_key?(state.running, issue.id) ->
+        state
+
+      MapSet.member?(state.claimed, issue.id) ->
+        state
+
+      available_slots(state) <= 0 ->
+        state
+
+      true ->
+        Logger.info("Starting delegated Linear AgentSession from poll fallback: session_id=#{session_id} #{issue_context(issue)} state=#{issue.state || "unknown"}")
+
+        persist_linear_agent_session_id(issue.id, session_id)
+
+        handle_linear_agent_session_event(state, %{
+          action: "created",
+          agent_session_id: session_id,
+          issue: issue,
+          prompt_body: nil,
+          prompt_context: nil
+        })
+    end
+  end
+
+  defp maybe_dispatch_linear_agent_session(_session, %State{} = state), do: state
+
+  defp linear_agent_session_poll_status?(status) when is_binary(status) do
+    status in ["active", "stale"]
+  end
+
+  defp linear_agent_session_poll_status?(_status), do: false
+
+  defp linear_agent_session_issue_dispatchable?(%Issue{} = issue) do
+    state_name = issue.state
+
+    is_binary(issue.id) and
+      is_binary(issue.identifier) and
+      is_binary(issue.title) and
+      is_binary(state_name) and
+      not waiting_for_human_review_state?(state_name) and
+      not terminal_issue_state?(state_name, terminal_state_set())
   end
 
   defp maybe_dispatch_polling(%State{} = state) do
@@ -349,6 +422,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
   def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
     should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
+  @spec linear_agent_session_poll_candidate_for_test(Issue.t(), String.t() | nil) :: boolean()
+  def linear_agent_session_poll_candidate_for_test(%Issue{} = issue, status) do
+    linear_agent_session_poll_status?(status) and linear_agent_session_issue_dispatchable?(issue)
   end
 
   @doc false
@@ -1321,6 +1400,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp complete_normal_agent_run(%State{} = state, issue_id, %{mode: :linear_agent}, session_id) do
     Logger.info("Linear Agent turn completed for issue_id=#{issue_id} session_id=#{session_id}; idling issue room")
     initialize_linear_agent_comment_marker(issue_id)
+    ensure_linear_agent_completion_handoff_state(issue_id)
 
     state
     |> complete_issue(issue_id)
@@ -1366,6 +1446,50 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp initialize_linear_agent_comment_marker(_issue_id), do: :ok
+
+  defp ensure_linear_agent_completion_handoff_state(issue_id) when is_binary(issue_id) do
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
+      {:ok, [%Issue{} = issue | _]} ->
+        maybe_move_unstarted_linear_agent_issue_to_review(issue)
+
+      {:ok, []} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.debug("Unable to verify Linear Agent completion handoff state for issue_id=#{issue_id}: #{inspect(reason)}")
+        :ok
+    end
+  end
+
+  defp ensure_linear_agent_completion_handoff_state(_issue_id), do: :ok
+
+  defp maybe_move_unstarted_linear_agent_issue_to_review(%Issue{state: state_name} = issue) do
+    if linear_agent_completion_needs_review_handoff?(state_name) do
+      case Tracker.update_issue_state(issue.id, @human_review_state) do
+        :ok ->
+          Logger.info("Moved completed Linear Agent issue to Human Review after unstarted-state handoff: #{issue_context(issue)}")
+          :ok
+
+        {:error, reason} ->
+          Logger.warning("Unable to move completed Linear Agent issue to Human Review for #{issue_context(issue)}: #{inspect(reason)}")
+          :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  @doc false
+  @spec linear_agent_completion_needs_review_handoff_for_test(String.t() | nil) :: boolean()
+  def linear_agent_completion_needs_review_handoff_for_test(state_name) do
+    linear_agent_completion_needs_review_handoff?(state_name)
+  end
+
+  defp linear_agent_completion_needs_review_handoff?(state_name) when is_binary(state_name) do
+    normalize_issue_state(state_name) in ["todo", "backlog"]
+  end
+
+  defp linear_agent_completion_needs_review_handoff?(_state_name), do: false
 
   defp complete_issue(%State{} = state, issue_id) do
     %{
@@ -2022,6 +2146,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     if is_binary(agent_session_id) and agent_session_id != "" do
       Logger.info("Routing #{length(comments)} Linear issue comment(s) into native AgentSession for #{issue_context(issue)}")
+      persist_linear_agent_session_id(issue.id, agent_session_id)
 
       handle_linear_agent_session_event(state, %{
         action: "prompted",
@@ -2035,6 +2160,23 @@ defmodule SymphonyElixir.Orchestrator do
       state
     end
   end
+
+  defp persist_linear_agent_session_id(issue_id, agent_session_id)
+       when is_binary(issue_id) and is_binary(agent_session_id) and agent_session_id != "" do
+    case StateStore.put_issue(issue_id, %{
+           agent_session_id: agent_session_id,
+           updated_at: DateTime.to_iso8601(DateTime.utc_now())
+         }) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Unable to persist Linear AgentSession id for issue_id=#{issue_id}: #{inspect(reason)}")
+        :ok
+    end
+  end
+
+  defp persist_linear_agent_session_id(_issue_id, _agent_session_id), do: :ok
 
   defp running_turn_active?(%{pid: pid, thread_id: thread_id, active_turn_id: active_turn_id})
        when is_pid(pid) and is_binary(thread_id) and is_binary(active_turn_id),

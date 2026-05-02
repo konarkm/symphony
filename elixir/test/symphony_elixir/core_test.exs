@@ -2524,6 +2524,38 @@ defmodule SymphonyElixir.CoreTest do
     assert issue_state["last_seen_comment_id"] == "linear-agent-polled-human-comment"
   end
 
+  test "linear agent session polling starts delegated non-review issues regardless of workflow state" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      linear_agent_enabled: true,
+      tracker_terminal_states: ["Done", "Canceled"]
+    )
+
+    backlog_issue = %Issue{
+      id: "issue-agent-backlog",
+      identifier: "KM-POLL",
+      title: "Delegated from Backlog",
+      state: "Backlog"
+    }
+
+    todo_issue = %{backlog_issue | id: "issue-agent-todo", state: "Todo"}
+    review_issue = %{backlog_issue | id: "issue-agent-review", state: "Human Review"}
+    done_issue = %{backlog_issue | id: "issue-agent-done", state: "Done"}
+
+    assert Orchestrator.linear_agent_session_poll_candidate_for_test(backlog_issue, "stale")
+    assert Orchestrator.linear_agent_session_poll_candidate_for_test(todo_issue, "active")
+    refute Orchestrator.linear_agent_session_poll_candidate_for_test(review_issue, "stale")
+    refute Orchestrator.linear_agent_session_poll_candidate_for_test(done_issue, "stale")
+    refute Orchestrator.linear_agent_session_poll_candidate_for_test(backlog_issue, "complete")
+  end
+
+  test "linear agent completion handoff treats unstarted states as ready for review" do
+    assert Orchestrator.linear_agent_completion_needs_review_handoff_for_test("Todo")
+    assert Orchestrator.linear_agent_completion_needs_review_handoff_for_test("Backlog")
+    refute Orchestrator.linear_agent_completion_needs_review_handoff_for_test("In Progress")
+    refute Orchestrator.linear_agent_completion_needs_review_handoff_for_test("Blocked")
+    refute Orchestrator.linear_agent_completion_needs_review_handoff_for_test("Human Review")
+  end
+
   test "linear agent retries once with a fresh thread when resumed thread is interrupted" do
     test_root =
       Path.join(

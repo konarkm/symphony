@@ -46,8 +46,40 @@ defmodule SymphonyElixir.Linear.Agent do
       nodes {
         id
         status
+        createdAt
         issue {
           id
+        }
+      }
+    }
+  }
+  """
+
+  @recent_sessions_query """
+  query SymphonyRecentAgentSessions {
+    agentSessions(first: 50, orderBy: createdAt) {
+      nodes {
+        id
+        status
+        createdAt
+        updatedAt
+        issue {
+          id
+          identifier
+          title
+          description
+          state {
+            name
+          }
+          branchName
+          url
+          labels {
+            nodes {
+              name
+            }
+          }
+          createdAt
+          updatedAt
         }
       }
     }
@@ -108,24 +140,30 @@ defmodule SymphonyElixir.Linear.Agent do
   @spec latest_session_id_for_issue(String.t()) :: {:ok, String.t() | nil} | {:error, term()}
   def latest_session_id_for_issue(issue_id) when is_binary(issue_id) and issue_id != "" do
     with {:ok, response} <- Client.graphql(@latest_session_for_issue_query, %{}) do
-      session_id =
-        response
-        |> get_in(["data", "agentSessions", "nodes"])
-        |> List.wrap()
-        |> Enum.find_value(fn
-          %{"id" => id, "issue" => %{"id" => ^issue_id}, "status" => status}
-          when status in ["active", "stale"] ->
-            id
-
-          _ ->
-            nil
-        end)
-
-      {:ok, session_id}
+      {:ok, latest_session_id_from_response(response, issue_id)}
     end
   end
 
   def latest_session_id_for_issue(_issue_id), do: {:ok, nil}
+
+  @spec recent_sessions() :: {:ok, [map()]} | {:error, term()}
+  def recent_sessions do
+    with {:ok, response} <- Client.graphql(@recent_sessions_query, %{}) do
+      {:ok, recent_sessions_from_response(response)}
+    end
+  end
+
+  @doc false
+  @spec latest_session_id_from_response_for_test(map(), String.t()) :: String.t() | nil
+  def latest_session_id_from_response_for_test(response, issue_id) do
+    latest_session_id_from_response(response, issue_id)
+  end
+
+  @doc false
+  @spec recent_sessions_from_response_for_test(map()) :: [map()]
+  def recent_sessions_from_response_for_test(response) do
+    recent_sessions_from_response(response)
+  end
 
   @spec validate_required_statuses([String.t()]) :: :ok | {:error, map()}
   def validate_required_statuses(required_statuses) when is_list(required_statuses) do
@@ -198,6 +236,53 @@ defmodule SymphonyElixir.Linear.Agent do
   end
 
   defp missing_statuses_for_team(_team, _required_statuses), do: []
+
+  defp recent_sessions_from_response(response) do
+    response
+    |> get_in(["data", "agentSessions", "nodes"])
+    |> List.wrap()
+    |> Enum.flat_map(&normalize_session/1)
+    |> Enum.sort_by(&session_sort_key/1, :desc)
+  end
+
+  defp latest_session_id_from_response(response, issue_id) do
+    response
+    |> get_in(["data", "agentSessions", "nodes"])
+    |> List.wrap()
+    |> Enum.filter(fn
+      %{"id" => id, "issue" => %{"id" => ^issue_id}} when is_binary(id) -> true
+      _ -> false
+    end)
+    |> Enum.sort_by(&session_created_at_sort_key/1, :desc)
+    |> Enum.find_value(&Map.get(&1, "id"))
+  end
+
+  defp session_created_at_sort_key(session) do
+    case parse_datetime(string_at(session, ["createdAt"])) do
+      %DateTime{} = datetime -> DateTime.to_unix(datetime, :microsecond)
+      nil -> 0
+    end
+  end
+
+  defp normalize_session(%{"id" => id, "issue" => %{} = issue} = session) when is_binary(id) do
+    [
+      %{
+        id: id,
+        status: string_at(session, ["status"]),
+        created_at: parse_datetime(string_at(session, ["createdAt"])),
+        updated_at: parse_datetime(string_at(session, ["updatedAt"])),
+        issue: normalize_issue(issue)
+      }
+    ]
+  end
+
+  defp normalize_session(_session), do: []
+
+  defp session_sort_key(%{created_at: %DateTime{} = created_at}) do
+    DateTime.to_unix(created_at, :microsecond)
+  end
+
+  defp session_sort_key(_session), do: 0
 
   defp normalize_issue(nil), do: nil
 
