@@ -445,6 +445,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec reconcile_issue_state_for_test(Issue.t(), map(), [String.t()], [String.t()]) :: map()
+  def reconcile_issue_state_for_test(%Issue{} = issue, %State{} = state, active_states, terminal_states)
+      when is_list(active_states) and is_list(terminal_states) do
+    reconcile_issue_state(
+      issue,
+      state,
+      normalized_state_set(active_states),
+      normalized_state_set(terminal_states)
+    )
+  end
+
+  @doc false
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
@@ -472,16 +484,19 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, true)
 
+      !issue_routable_to_worker?(issue) ->
+        Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
+
+        terminate_running_issue(state, issue.id, false)
+
+      linear_agent_worker_continues?(state, issue.id) ->
+        refresh_running_issue_state(state, issue)
+
       waiting_for_human_review_state?(issue.state) and human_review_worker_continues?(state, issue.id) ->
         refresh_running_issue_state(state, issue)
 
       waiting_for_human_review_state?(issue.state) ->
         Logger.info("Issue moved to Human Review: #{issue_context(issue)} state=#{issue.state}; parking active agent")
-
-        terminate_running_issue(state, issue.id, false)
-
-      !issue_routable_to_worker?(issue) ->
-        Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
         terminate_running_issue(state, issue.id, false)
 
@@ -787,18 +802,21 @@ defmodule SymphonyElixir.Orchestrator do
     String.downcase(String.trim(state_name))
   end
 
-  defp terminal_state_set do
-    Config.settings!().tracker.terminal_states
+  defp normalized_state_set(state_names) when is_list(state_names) do
+    state_names
     |> Enum.map(&normalize_issue_state/1)
     |> Enum.filter(&(&1 != ""))
     |> MapSet.new()
   end
 
+  defp terminal_state_set do
+    Config.settings!().tracker.terminal_states
+    |> normalized_state_set()
+  end
+
   defp active_state_set do
     Config.settings!().tracker.active_states
-    |> Enum.map(&normalize_issue_state/1)
-    |> Enum.filter(&(&1 != ""))
-    |> MapSet.new()
+    |> normalized_state_set()
   end
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil, runner_opts \\ []) do
@@ -2258,9 +2276,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp review_comment_retry?(metadata) when is_map(metadata), do: metadata[:mode] == :review_comment
 
+  defp linear_agent_worker_continues?(%State{} = state, issue_id) when is_binary(issue_id) do
+    case Map.get(state.running, issue_id) do
+      %{mode: :linear_agent} -> true
+      _ -> false
+    end
+  end
+
+  defp linear_agent_worker_continues?(_state, _issue_id), do: false
+
   defp human_review_worker_continues?(%State{} = state, issue_id) when is_binary(issue_id) do
     case Map.get(state.running, issue_id) do
-      %{mode: mode} when mode in [:review_comment, :linear_agent] -> true
+      %{mode: :review_comment} -> true
       _ -> false
     end
   end

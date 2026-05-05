@@ -2553,6 +2553,94 @@ defmodule SymphonyElixir.CoreTest do
     refute Orchestrator.linear_agent_session_poll_candidate_for_test(backlog_issue, "complete")
   end
 
+  test "linear agent running room stays alive in delegated backlog state" do
+    issue = %Issue{
+      id: "issue-agent-backlog-running",
+      identifier: "KM-RUN",
+      title: "Delegated from Backlog",
+      state: "Backlog",
+      assigned_to_worker: true
+    }
+
+    worker = spawn(fn -> Process.sleep(:infinity) end)
+    worker_ref = Process.monitor(worker)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue.id => %{
+          pid: worker,
+          ref: worker_ref,
+          identifier: issue.identifier,
+          issue: issue,
+          started_at: DateTime.utc_now(),
+          mode: :linear_agent
+        }
+      },
+      claimed: MapSet.new([issue.id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    updated_state =
+      Orchestrator.reconcile_issue_state_for_test(
+        issue,
+        state,
+        ["Todo", "In Progress"],
+        ["Done", "Canceled"]
+      )
+
+    assert Map.has_key?(updated_state.running, issue.id)
+    assert MapSet.member?(updated_state.claimed, issue.id)
+    assert Process.alive?(worker)
+
+    Process.demonitor(worker_ref, [:flush])
+    Process.exit(worker, :kill)
+  end
+
+  test "linear agent running room stops when issue is no longer routed to Symphony" do
+    issue = %Issue{
+      id: "issue-agent-unassigned-running",
+      identifier: "KM-UNROUTED",
+      title: "No longer delegated",
+      state: "Backlog",
+      assigned_to_worker: false
+    }
+
+    worker = spawn(fn -> Process.sleep(:infinity) end)
+    worker_ref = Process.monitor(worker)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue.id => %{
+          pid: worker,
+          ref: worker_ref,
+          identifier: issue.identifier,
+          issue: %{issue | assigned_to_worker: true},
+          started_at: DateTime.utc_now(),
+          mode: :linear_agent
+        }
+      },
+      claimed: MapSet.new([issue.id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    updated_state =
+      Orchestrator.reconcile_issue_state_for_test(
+        issue,
+        state,
+        ["Todo", "In Progress"],
+        ["Done", "Canceled"]
+      )
+
+    refute Map.has_key?(updated_state.running, issue.id)
+    refute MapSet.member?(updated_state.claimed, issue.id)
+
+    eventually(fn ->
+      refute Process.alive?(worker)
+    end)
+
+    Process.demonitor(worker_ref, [:flush])
+  end
+
   test "linear agent created acknowledgement is deduped per AgentSession" do
     assert Orchestrator.linear_agent_created_ack_needed_for_test(%{}, "session-1")
 
