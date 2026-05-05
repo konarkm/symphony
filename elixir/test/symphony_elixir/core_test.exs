@@ -2326,7 +2326,7 @@ defmodule SymphonyElixir.CoreTest do
     refute_receive {:memory_tracker_comment_reply, _, _, _}, 100
   end
 
-  test "linear agent top-level issue comment steers running session before state persistence and ignores bot replies" do
+  test "linear agent top-level issue comments are passive unless they are bridge commands" do
     state_path =
       Path.join(
         System.tmp_dir!(),
@@ -2405,11 +2405,8 @@ defmodule SymphonyElixir.CoreTest do
       orchestrator_name
     )
 
-    assert_receive {:memory_tracker_comment_reaction, "linear-agent-human-comment", "eyes"}
-    assert_receive {:symphony_steer, steering_prompt}, 1_000
-    assert steering_prompt =~ "Linear AgentSession event: prompted"
-    assert steering_prompt =~ "New top-level Linear issue comment from Konark M"
-    assert steering_prompt =~ "Please tighten the spacing."
+    refute_receive {:memory_tracker_comment_reaction, "linear-agent-human-comment", "eyes"}, 100
+    refute_receive {:symphony_steer, _steering_prompt}, 100
 
     Orchestrator.handle_agent_session_event(
       %{
@@ -2451,7 +2448,7 @@ defmodule SymphonyElixir.CoreTest do
     refute_receive {:memory_tracker_comment_reply, _, _, _}, 100
   end
 
-  test "linear agent comment polling uses local state marker instead of status comment" do
+  test "linear agent comment polling marks non-command comments as passive context" do
     state_path =
       Path.join(
         System.tmp_dir!(),
@@ -2465,7 +2462,7 @@ defmodule SymphonyElixir.CoreTest do
       id: "issue-linear-agent-polled-comment",
       identifier: "MT-258",
       title: "Polled comment issue",
-      description: "Human Review comments should still wake the Linear Agent path",
+      description: "Human Review comments should stay passive in Linear Agent mode",
       state: "Human Review",
       labels: []
     }
@@ -2522,8 +2519,9 @@ defmodule SymphonyElixir.CoreTest do
 
     _updated_state = Orchestrator.poll_comment_steering_for_test(state)
 
-    assert_receive {:memory_tracker_comment_reaction, "linear-agent-polled-human-comment", "eyes"}
+    refute_receive {:memory_tracker_comment_reaction, "linear-agent-polled-human-comment", "eyes"}, 100
     refute_receive {:memory_tracker_comment_update, _, _}, 100
+    refute_receive {:symphony_steer, _}, 100
 
     issue_state = SymphonyElixir.StateStore.get_issue(issue.id)
     assert issue_state["agent_session_id"] == "agent-session-258"

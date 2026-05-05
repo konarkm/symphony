@@ -846,10 +846,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_linear_agent_session_event(
          %State{} = state,
-         %{action: "issueNewComment", issue: %Issue{} = issue, comment: %Comment{} = comment} = event
+         %{action: "issueNewComment", issue: %Issue{} = issue, comment: %Comment{} = comment}
        ) do
     issue = refresh_linear_agent_issue(issue)
-    event = Map.put(event, :issue, issue)
 
     cond do
       not top_level_human_comment?(comment) ->
@@ -859,12 +858,12 @@ defmodule SymphonyElixir.Orchestrator do
         handle_linear_agent_bridge_command(state, issue, comment)
 
       linear_agent_issue_paused?(issue.id) ->
-        acknowledge_comment(comment)
-        Logger.info("Issue is paused; acknowledged Linear Agent issue comment without worker routing for #{issue_context(issue)}")
+        Logger.info("Ignoring non-command Linear issue comment for paused issue in Agent mode: #{issue_context(issue)} comment_id=#{comment.id}")
         state
 
       true ->
-        handle_linear_agent_issue_comment(state, issue, comment, event)
+        Logger.info("Ignoring non-command Linear issue comment in Agent mode; use AgentSession prompts for conversation: #{issue_context(issue)} comment_id=#{comment.id}")
+        state
     end
   end
 
@@ -980,57 +979,6 @@ defmodule SymphonyElixir.Orchestrator do
   defp bridge_command_paused_after(%{action: :cancel}, _marker), do: true
   defp bridge_command_paused_after(%{action: :resume}, _marker), do: false
   defp bridge_command_paused_after(_command, marker), do: CommentSteering.paused?(marker)
-
-  defp handle_linear_agent_issue_comment(%State{} = state, %Issue{} = issue, %Comment{} = comment, event) do
-    issue_state = StateStore.get_issue(issue.id)
-
-    agent_session_id =
-      Map.get(event, :agent_session_id) ||
-        Map.get(issue_state, "agent_session_id") ||
-        get_in(state.running, [issue.id, :agent_session_id])
-
-    if is_binary(agent_session_id) and agent_session_id != "" do
-      acknowledge_comment(comment)
-
-      handle_linear_agent_session_event(state, %{
-        event
-        | action: "prompted",
-          agent_session_id: agent_session_id,
-          prompt_body: linear_agent_comment_prompt(comment)
-      })
-    else
-      Logger.info("Ignoring non-command Linear issue comment without known AgentSession for #{issue_context(issue)} comment_id=#{comment.id}")
-      state
-    end
-  end
-
-  defp linear_agent_comment_prompt(%Comment{} = comment) do
-    author = comment.author_name || "A human"
-    body = comment.body || ""
-
-    """
-    New top-level Linear issue comment from #{author}:
-
-    #{body}
-    """
-  end
-
-  defp linear_agent_comment_batch_prompt(comments) when is_list(comments) do
-    """
-    New top-level Linear issue comment context arrived:
-
-    #{CommentSteering.format_review_context(comments)}
-    """
-  end
-
-  defp latest_agent_session_id_for_issue(%Issue{id: issue_id}) when is_binary(issue_id) do
-    case Agent.latest_session_id_for_issue(issue_id) do
-      {:ok, session_id} -> session_id
-      {:error, _reason} -> nil
-    end
-  end
-
-  defp latest_agent_session_id_for_issue(_issue), do: nil
 
   defp linear_agent_comment_marker_state(issue_id) when is_binary(issue_id) do
     issue_state = StateStore.get_issue(issue_id)
@@ -1796,7 +1744,7 @@ defmodule SymphonyElixir.Orchestrator do
         |> flush_worker_comments(issue_id, issue, entry)
         |> process_linear_agent_polled_bridge_command(issue, comment)
       else
-        process_linear_agent_polled_worker_comment(acc, issue.id, comment)
+        process_linear_agent_polled_passive_comment(acc, issue.id, comment)
       end
     end)
     |> flush_worker_comments(issue_id, issue, entry)
@@ -1821,22 +1769,16 @@ defmodule SymphonyElixir.Orchestrator do
     %{acc | state: state, marker: marker}
   end
 
-  defp process_linear_agent_polled_worker_comment(acc, issue_id, %Comment{} = comment) do
-    acknowledge_comment(comment)
-
+  defp process_linear_agent_polled_passive_comment(acc, issue_id, %Comment{} = comment) do
     marker = CommentSteering.advance_marker(acc.marker, comment)
 
     case persist_linear_agent_comment_marker(marker, issue_id) do
       :ok ->
-        if CommentSteering.paused?(marker) do
-          Logger.info("Issue is paused; acknowledged non-command Linear comment without worker routing for issue_id=#{issue_id}")
-          %{acc | marker: marker}
-        else
-          %{acc | marker: marker, worker_comments: acc.worker_comments ++ [comment]}
-        end
+        Logger.debug("Marked non-command Linear issue comment as passive context in Agent mode: issue_id=#{issue_id} comment_id=#{comment.id}")
+        %{acc | marker: marker}
 
       {:error, reason} ->
-        Logger.warning("Skipping Linear Agent comment routing after local marker write failure for issue_id=#{issue_id}: #{inspect(reason)}")
+        Logger.warning("Unable to persist passive Linear Agent comment marker for issue_id=#{issue_id}: #{inspect(reason)}")
         %{acc | marker: marker}
     end
   end
@@ -2121,34 +2063,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp route_comment_steering(%State{} = state, _issue_id, %Issue{} = issue, {:human_review, _entry}, comments, _message) do
     if Config.settings!().linear_agent.enabled do
-      route_linear_agent_polled_comments(state, issue, comments)
+      Logger.debug("Ignoring #{length(comments)} non-command Human Review comment(s) in Agent mode for #{issue_context(issue)}")
+      state
     else
       dispatch_review_comment_issue(state, issue, comments)
-    end
-  end
-
-  defp route_linear_agent_polled_comments(%State{} = state, %Issue{} = issue, comments) do
-    issue_state = StateStore.get_issue(issue.id)
-
-    agent_session_id =
-      Map.get(issue_state, "agent_session_id") ||
-        get_in(state.running, [issue.id, :agent_session_id]) ||
-        latest_agent_session_id_for_issue(issue)
-
-    if is_binary(agent_session_id) and agent_session_id != "" do
-      Logger.info("Routing #{length(comments)} Linear issue comment(s) into native AgentSession for #{issue_context(issue)}")
-      persist_linear_agent_session_id(issue.id, agent_session_id)
-
-      handle_linear_agent_session_event(state, %{
-        action: "prompted",
-        agent_session_id: agent_session_id,
-        issue: issue,
-        prompt_body: linear_agent_comment_batch_prompt(comments),
-        prompt_context: nil
-      })
-    else
-      Logger.info("Ignoring non-command Linear issue comment without known AgentSession for #{issue_context(issue)}")
-      state
     end
   end
 
