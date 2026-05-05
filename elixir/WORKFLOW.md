@@ -89,7 +89,11 @@ New Linear comment context:
 - Do not create or maintain a persistent `## Symphony Status` comment. Do not store hidden metadata in Linear comments.
 - Use `linear_agent_activity` for sparse useful updates, questions, final responses, and errors. Use `response` for direct answers/final replies, `thought` for progress, `elicitation` for questions, and `error` for blockers; do not invent custom activity types such as `update`.
 - Use `linear_agent_update_session` for Agent Plans and PR/dashboard external URLs.
-- Use `linear_update_issue_state` for normal coworker state transitions. After a direct non-code answer or ready handoff, move the issue to `Human Review`. Use `Blocked` only when you need missing information or access.
+- Use `linear_update_issue_state` for normal coworker state transitions. Do not change state just because the AgentSession started or because you answered a conversational prompt.
+- Classify direct questions before changing state:
+  - If the issue or current prompt delegates the question itself as the task, answering is the work. Move to `In Progress` when you begin and to `Human Review` or `Done` when the answer is delivered, depending on whether review is useful.
+  - If the issue already represents broader work and the prompt/comment is a question about that existing work, answer through Agent Activity and leave the issue state unchanged unless you actually begin/change task execution or become blocked.
+- Use `Blocked` only when you need missing information or access.
 - Use Linear MCP tools or `linear_graphql` for advanced Linear operations that are not covered by the first-class tools.
 - Use `linear_upload_file` for generated artifacts, logs, screenshots, images, videos, and other files instead of pasting long content into comments.
 - Keep updates short, conversational, and useful.
@@ -118,7 +122,7 @@ New Linear comment context:
 - `Todo`: if delegated to Symphony, move to `In Progress` before active work.
 - `In Progress`: work on the current prompt, update Agent Plan when useful, and comment/activity sparsely.
 - `Blocked`: use when repo context, credentials, permissions, or decisions are missing. Ask a concise elicitation.
-- `Human Review`: use when the answer/work/PR is ready for human review. New prompts or moving back to `In Progress` should resume work in the same issue room.
+- `Human Review`: use when the delegated answer/work/PR is ready for human review. New prompts or moving back to `In Progress` should resume work in the same issue room.
 - `Merging`: open and follow `.codex/skills/land/SKILL.md`; use the existing `land` flow, then move the issue to `Done`.
 - `Done`/`Canceled`: terminal; do nothing.
 
@@ -141,4 +145,4 @@ Natural approval comments do not trigger merging in this MVP. The issue must be 
 
 ## Completion
 
-Before moving to `Human Review`, make sure requested validation has run and publish the PR/branch when the task is code work. Add PR URLs to the AgentSession external URLs. For non-code answers, respond clearly and leave the issue in `Human Review`. If blocked, use an elicitation or error activity with the exact missing thing.
+Before moving to `Human Review`, make sure requested validation has run and publish the PR/branch when the task is code work. Add PR URLs to the AgentSession external URLs. For non-code questions that are the delegated task, respond clearly and hand off to `Human Review` or `Done`; for questions about existing work, respond clearly and keep the state unchanged unless the answer changes the work. If blocked, use an elicitation or error activity with the exact missing thing.

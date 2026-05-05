@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   @behaviour SymphonyElixir.Tracker
 
+  alias SymphonyElixir.Config
   alias SymphonyElixir.Linear.{Client, Comment}
 
   @comment_page_size 50
@@ -39,7 +40,7 @@ defmodule SymphonyElixir.Linear.Adapter do
             id
             name
             displayName
-            isBot
+            isMe
           }
         }
       }
@@ -204,7 +205,7 @@ defmodule SymphonyElixir.Linear.Adapter do
         author_id: Map.get(user, "id"),
         author_name: Map.get(user, "displayName") || Map.get(user, "name"),
         parent_id: Map.get(comment, "parentId"),
-        author_is_bot: Map.get(user, "isBot") == true
+        author_is_bot: author_is_current_linear_agent?(user)
       }
     ]
   end
@@ -219,4 +220,12 @@ defmodule SymphonyElixir.Linear.Adapter do
   end
 
   defp parse_datetime(_value), do: nil
+
+  defp author_is_current_linear_agent?(user) when is_map(user) do
+    Map.get(user, "isMe") == true and linear_agent_enabled?()
+  end
+
+  defp linear_agent_enabled? do
+    Config.settings!().linear_agent.enabled
+  end
 end

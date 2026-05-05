@@ -256,7 +256,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                    "parentId" => "comment-1",
                    "createdAt" => "not-a-date",
                    "updatedAt" => nil,
-                   "user" => %{"id" => "user-2", "name" => "Other", "isBot" => true}
+                   "user" => %{"id" => "user-2", "name" => "Other", "isMe" => true}
                  },
                  %{"body" => "missing id"}
                ]
@@ -275,14 +275,15 @@ defmodule SymphonyElixir.ExtensionsTest do
                 parent_id: "comment-1",
                 created_at: nil,
                 updated_at: nil,
-                author_is_bot: true
+                author_is_bot: false
               }
             ]} =
              Adapter.fetch_issue_comments("issue-1")
 
     assert_receive {:graphql_called, comments_query, %{first: 50, issueId: "issue-1"}}
     assert comments_query =~ "comments"
-    assert comments_query =~ "isBot"
+    assert comments_query =~ "isMe"
+    refute comments_query =~ "isBot"
 
     Process.put({FakeLinearClient, :graphql_result}, {:error, :boom})
     assert {:error, :boom} = Adapter.fetch_issue_comments("issue-1")
@@ -466,6 +467,45 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd")
+  end
+
+  test "linear adapter treats isMe comments as bot-authored only in Linear Agent OAuth mode" do
+    Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+
+    token_path = Path.join(System.tmp_dir!(), "linear-token-#{System.unique_integer([:positive])}.json")
+
+    write_workflow_file!(
+      Workflow.workflow_file_path(),
+      linear_agent_enabled: true,
+      linear_agent_client_id: "client",
+      linear_agent_client_secret: "secret",
+      linear_agent_token_path: token_path
+    )
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok,
+       %{
+         "data" => %{
+           "issue" => %{
+             "comments" => %{
+               "nodes" => [
+                 %{
+                   "id" => "comment-app",
+                   "body" => "app-authored",
+                   "createdAt" => "2026-04-28T01:00:00Z",
+                   "updatedAt" => "2026-04-28T01:00:01Z",
+                   "user" => %{"id" => "app-user", "name" => "Symphony", "isMe" => true}
+                 }
+               ]
+             }
+           }
+         }
+       }}
+    )
+
+    assert {:ok, [%Comment{id: "comment-app", author_is_bot: true}]} =
+             Adapter.fetch_issue_comments("issue-1")
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do
