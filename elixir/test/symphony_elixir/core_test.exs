@@ -1935,7 +1935,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "linear agent issue status event starts delegated backlog issue without bridge-owned state change" do
+  test "linear agent issue status event starts issue in action state without bridge-owned state change" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1977,9 +1977,9 @@ defmodule SymphonyElixir.CoreTest do
       issue = %Issue{
         id: "issue-linear-agent-status-start",
         identifier: "MT-261",
-        title: "Backlog delegated issue",
+        title: "In Progress delegated issue",
         description: "10*2.5",
-        state: "Backlog",
+        state: "In Progress",
         url: "https://example.org/issues/MT-261",
         labels: []
       }
@@ -2030,6 +2030,133 @@ defmodule SymphonyElixir.CoreTest do
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "linear agent status change dispatch predicate only allows action states" do
+    allowed = ["In Progress", "Rework", "Merging", " in progress "]
+    ignored = ["Backlog", "Todo", "Blocked", "Human Review", "Done", "Canceled", "Cancelled", ""]
+
+    for state_name <- allowed do
+      assert Orchestrator.linear_agent_action_dispatchable_for_test("issueStatusChanged", %Issue{
+               id: "issue-allowed-#{state_name}",
+               identifier: "MT-A",
+               title: "Allowed",
+               state: state_name
+             })
+    end
+
+    for state_name <- ignored do
+      refute Orchestrator.linear_agent_action_dispatchable_for_test("issueStatusChanged", %Issue{
+               id: "issue-ignored-#{state_name}",
+               identifier: "MT-I",
+               title: "Ignored",
+               state: state_name
+             })
+    end
+
+    assert Orchestrator.linear_agent_action_dispatchable_for_test("prompted", %Issue{
+             id: "issue-prompted",
+             identifier: "MT-P",
+             title: "Prompted",
+             state: "Human Review"
+           })
+  end
+
+  test "linear agent issue status event ignores passive destination states" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-linear-agent-status-ignore-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(workspace_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$line" in
+          *'"id":1'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-status-ignore"}}}'
+            ;;
+          *'"method":"turn/start"'*)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-status-ignore"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        linear_agent_enabled: true,
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        prompt: "Base issue prompt for {{ issue.identifier }}"
+      )
+
+      ignored_states = ["Backlog", "Todo", "Blocked", "Human Review", "Done", "Canceled"]
+
+      issues =
+        Enum.with_index(ignored_states, fn state_name, index ->
+          %Issue{
+            id: "issue-linear-agent-status-ignore-#{index}",
+            identifier: "MT-26#{index}",
+            title: "#{state_name} ignored issue",
+            description: "This should not start from issueStatusChanged",
+            state: state_name,
+            url: "https://example.org/issues/MT-26#{index}",
+            labels: []
+          }
+        end)
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, issues)
+
+      orchestrator_name = Module.concat(__MODULE__, :LinearAgentStatusIgnoreOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+
+        System.delete_env("SYMP_TEST_CODEx_TRACE")
+        File.rm_rf(test_root)
+      end)
+
+      Enum.each(issues, fn issue ->
+        Orchestrator.handle_agent_session_event(
+          %{
+            action: "issueStatusChanged",
+            agent_session_id: "agent-session-#{issue.id}",
+            prompt_body: nil,
+            prompt_context: "<issue identifier=\"#{issue.identifier}\"><title>#{issue.title}</title></issue>",
+            issue: issue
+          },
+          orchestrator_name
+        )
+      end)
+
+      Process.sleep(200)
+
+      refute File.exists?(trace_file)
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
     end
   end

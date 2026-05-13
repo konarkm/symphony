@@ -877,11 +877,16 @@ defmodule SymphonyElixir.Orchestrator do
         prompt = linear_agent_prompt(event)
         Logger.info("Linear AgentSession action=#{action} session_id=#{agent_session_id || "unknown"} #{issue_context(issue)} state=#{issue.state || "unknown"}")
 
-        case Map.get(state.running, issue.id) do
-          %{pid: pid} = running_entry when is_pid(pid) ->
+        cond do
+          not linear_agent_action_dispatchable?(action, issue) ->
+            Logger.info("Ignoring Linear AgentSession action=#{action} for passive state #{issue.state || "unknown"} on #{issue_context(issue)}")
+            state
+
+          match?(%{pid: pid} when is_pid(pid), Map.get(state.running, issue.id)) ->
+            running_entry = Map.fetch!(state.running, issue.id)
             handle_existing_linear_agent_process(state, issue, event, action, agent_session_id, running_entry, prompt)
 
-          _ ->
+          true ->
             dispatch_linear_agent_session_event(state, issue, event, action, agent_session_id)
         end
 
@@ -895,6 +900,19 @@ defmodule SymphonyElixir.Orchestrator do
     Logger.warning("Ignoring Linear AgentSession event without issue: #{inspect(Map.take(event, [:action, :agent_session_id]))}")
     state
   end
+
+  @doc false
+  @spec linear_agent_action_dispatchable_for_test(String.t(), Issue.t()) :: boolean()
+  def linear_agent_action_dispatchable_for_test(action, %Issue{} = issue) do
+    linear_agent_action_dispatchable?(action, issue)
+  end
+
+  defp linear_agent_action_dispatchable?("issueStatusChanged", %Issue{state: state_name}) when is_binary(state_name) do
+    normalize_issue_state(state_name) in ["in progress", "rework", "merging"]
+  end
+
+  defp linear_agent_action_dispatchable?("issueStatusChanged", _issue), do: false
+  defp linear_agent_action_dispatchable?(_action, _issue), do: true
 
   defp handle_linear_agent_bridge_command(%State{} = state, %Issue{} = issue, %Comment{} = comment) do
     case BridgeCommand.parse(comment) do
